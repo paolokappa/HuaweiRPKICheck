@@ -68,7 +68,7 @@ def encrypt_data(data, key):
 
 # Data to encrypt and store
 config_data = """
-hostname=192.168.220.7
+hostname=192.168.1.1
 username=rpki_sessions
 password=YourPassword123
 smtp_server=smtp.example.com
