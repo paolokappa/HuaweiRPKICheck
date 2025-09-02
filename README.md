@@ -1,20 +1,47 @@
-# HuaweiRPKICheck
-
 <div align="center">
+<br />
 
-![Python](https://img.shields.io/badge/python-v3.6+-blue.svg)
-![Paramiko](https://img.shields.io/badge/paramiko-2.7.2+-green.svg)
-![Cryptography](https://img.shields.io/badge/cryptography-3.4.8+-red.svg)
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Version](https://img.shields.io/badge/version-2.0-brightgreen.svg)
-![Maintenance](https://img.shields.io/badge/Maintained%3F-yes-green.svg)
+<h1 align="center">
+  <br>
+  HuaweiRPKICheck v2.0
+  <br>
+</h1>
 
-### Enterprise-Grade RPKI Session Management for Huawei NetEngine Routers
+<h4 align="center">Enterprise-Grade RPKI Session Management for Huawei NetEngine Routers</h4>
 
-*Automated monitoring, recovery, and alerting system for critical RPKI infrastructure*
+<p align="center">
+  <a href="https://www.python.org/">
+    <img src="https://img.shields.io/badge/python-v3.6+-blue.svg" alt="Python">
+  </a>
+  <a href="https://github.com/paramiko/paramiko">
+    <img src="https://img.shields.io/badge/paramiko-2.7.2+-green.svg" alt="Paramiko">
+  </a>
+  <a href="https://cryptography.io/">
+    <img src="https://img.shields.io/badge/cryptography-3.4.8+-red.svg" alt="Cryptography">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License">
+  </a>
+  <a href="https://github.com/paolokappa/HuaweiRPKICheck/releases">
+    <img src="https://img.shields.io/badge/version-2.0-brightgreen.svg" alt="Version">
+  </a>
+  <a href="https://github.com/paolokappa/HuaweiRPKICheck/graphs/commit-activity">
+    <img src="https://img.shields.io/badge/Maintained%3F-yes-green.svg" alt="Maintenance">
+  </a>
+</p>
 
-[Features](#-key-features) • [Installation](#-installation) • [Configuration](#-configuration) • [Documentation](#-documentation) • [Support](#-support)
+<p align="center">
+  <b>Automated monitoring, recovery, and alerting system for critical RPKI infrastructure</b>
+  <br>
+  <br>
+  <a href="#-key-features">Features</a> •
+  <a href="#-installation">Installation</a> •
+  <a href="#-configuration">Configuration</a> •
+  <a href="#-documentation">Documentation</a> •
+  <a href="#-support">Support</a>
+</p>
 
+<br>
 </div>
 
 ---
