@@ -270,41 +270,29 @@ if previous.state == 'Problem' and current.state == 'Established':
 
 ---
 
-## 📧 Email Templates
+## 📧 Email Notifications
+
+The system sends two types of professional HTML emails:
 
 ### Problem Alert
-<table>
-<tr>
-<td>
-
-- **Header**: Navy blue (#1e3c72) with red accent
-- **Content**: Detailed session status table
-- **Actions**: Automated reset confirmation
-- **Footer**: Support contact information
-
-</td>
-<td>
-<img src="https://via.placeholder.com/300x200/1e3c72/ffffff?text=Problem+Alert" alt="Problem Alert">
-</td>
-</tr>
-</table>
+- **Trigger**: When sessions are in problematic states (Idle, Negotiation >30min, Syn)
+- **Design**: Navy blue header (#1e3c72) with red bottom border
+- **Content**: 
+  - Detailed session status table with color-coded states
+  - Automatic reset confirmation for stuck sessions
+  - Recommended manual actions
+- **Frequency**: Maximum once per hour to prevent alert fatigue
 
 ### Recovery Notification
-<table>
-<tr>
-<td>
+- **Trigger**: When previously problematic sessions return to Established state
+- **Design**: Navy blue header (#1e3c72) with green bottom border  
+- **Content**:
+  - List of recovered sessions
+  - Current healthy status confirmation
+  - No action required message
+- **Frequency**: Maximum once per 30 minutes
 
-- **Header**: Navy blue (#1e3c72) with green accent
-- **Content**: Recovered sessions list
-- **Status**: All-clear confirmation
-- **Footer**: Operational metrics
-
-</td>
-<td>
-<img src="https://via.placeholder.com/300x200/1e3c72/90ee90?text=Recovery+Notice" alt="Recovery Notice">
-</td>
-</tr>
-</table>
+Both emails include responsive HTML design, clear visual indicators, and GOLINE SA branding.
 
 ---
 
