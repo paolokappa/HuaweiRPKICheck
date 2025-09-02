@@ -1,175 +1,1059 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Huawei RPKI Check v2.0 - Enhanced version with improved error handling and logging
+Maintains backward compatibility while adding robustness and monitoring capabilities
+"""
+
 import paramiko
 import time
+import logging
+import sys
+import os
+import json
+import argparse
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
 from cryptography.fernet import Fernet
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import re
+import socket
+from pathlib import Path
 
-# Function to decrypt data
-def decrypt_data(key, file_path):
-    fernet = Fernet(key)
-    with open(file_path, "rb") as enc_file:
-        encrypted_data = enc_file.read()
-    decrypted_data = fernet.decrypt(encrypted_data).decode()
-    config = {}
-    for line in decrypted_data.strip().split("\n"):
-        k, v = line.split("=")
-        config[k.strip()] = v.strip()
-    return config
+# Configuration
+BASE_DIR = Path("/opt/HuaweiRPKICheck")
+LOG_DIR = Path("/var/log/huawei_rpki")
+LOG_FILE = LOG_DIR / f"rpki_check_{datetime.now().strftime('%Y%m')}.log"
+STATE_FILE = BASE_DIR / "rpki_state.json"
+SECRET_KEY_FILE = BASE_DIR / "secret.key"
+CONFIG_FILE = BASE_DIR / "HuaweiRPKICheck.conf"
 
-# Function to connect via SSH and execute commands
-def ssh_connect_and_execute(hostname, username, password, commands):
-    try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname, username=username, password=password)
-        ssh = client.invoke_shell()
+# Create log directory if it doesn't exist
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-        for command in commands:
-            ssh.send(command + '\n')
-            time.sleep(2)
-
-        output = ssh.recv(65535).decode('utf-8')
-        return output
-    finally:
-        client.close()
-
-# Function to generate the RPKI sessions HTML table with highlights for "Idle", "Negotiation", "Established" and "Syn" states
-def generate_rpki_table(output):
-    session_lines = output.splitlines()
-    rows = []
-    for line in session_lines:
-        if re.search(r"\d+\.\d+\.\d+\.\d+", line):  # Find lines with IP
-            rows.append(line.strip())
-
-    table_html = """
-    <table border="1" cellpadding="5" cellspacing="0">
-        <thead>
-            <tr>
-                <th>Session</th>
-                <th>State</th>
-                <th>Age</th>
-                <th>IPv4/IPv6 record</th>
-            </tr>
-        </thead>
-        <tbody>
-    """
+# Configure logging
+def setup_logging(verbose: bool = False) -> logging.Logger:
+    """Setup logging configuration"""
+    log_level = logging.DEBUG if verbose else logging.INFO
     
-    established_sessions = []
-    idle_sessions = []
-    negotiation_sessions = []
-    syn_sessions = []
-    sessions_to_reset = []
+    # Create logger
+    logger = logging.getLogger('HuaweiRPKICheck')
+    logger.setLevel(log_level)
+    
+    # File handler with rotation
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=10*1024*1024, backupCount=5
+    )
+    file_handler.setLevel(log_level)
+    
+    # Console handler for test mode
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.WARNING)
+    
+    # Formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
 
-    for row in rows:
-        parts = re.split(r"\s{2,}", row)  # Split row based on multiple spaces
-        if len(parts) >= 4:  # Ensure at least 4 elements exist
-            session_ip = parts[0]
-            state = parts[1]
-            record = parts[3]
-            # Extract IPv4/IPv6 record numbers
-            ipv4v6_record = list(map(int, record.split('/')))
-            if state == "Idle" or state == "Negotiation":
-                if state == "Idle":
-                    idle_sessions.append(session_ip)
-                if state == "Negotiation":
-                    negotiation_sessions.append(session_ip)
+# Import logging module for handlers
+import logging.handlers
+
+logger = setup_logging()
+
+class RPKIChecker:
+    """Main class for RPKI session checking with improved error handling"""
+    
+    def __init__(self, config: Dict[str, str], test_mode: bool = False):
+        self.config = config
+        self.test_mode = test_mode
+        self.ssh_client = None
+        self.state = self.load_state()
+        self.session_history = []
+        
+    def load_state(self) -> Dict:
+        """Load previous state from file"""
+        try:
+            if STATE_FILE.exists():
+                with open(STATE_FILE, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not load state file: {e}")
+        return {
+            "last_check": None, 
+            "consecutive_failures": 0, 
+            "last_alert": None,
+            "previous_analysis": None,
+            "last_recovery_alert": None
+        }
+    
+    def save_state(self):
+        """Save current state to file"""
+        try:
+            self.state["last_check"] = datetime.now().isoformat()
+            with open(STATE_FILE, 'w') as f:
+                json.dump(self.state, f, indent=2)
+        except Exception as e:
+            logger.error(f"Could not save state file: {e}")
+    
+    def decrypt_config(self, key_path: Path, config_path: Path) -> Dict[str, str]:
+        """Decrypt configuration file with error handling"""
+        try:
+            with open(key_path, "rb") as key_file:
+                key = key_file.read()
+            
+            fernet = Fernet(key)
+            
+            with open(config_path, "rb") as enc_file:
+                encrypted_data = enc_file.read()
+            
+            decrypted_data = fernet.decrypt(encrypted_data).decode()
+            
+            config = {}
+            for line in decrypted_data.strip().split("\n"):
+                if '=' in line:
+                    k, v = line.split("=", 1)
+                    config[k.strip()] = v.strip()
+            
+            # Validate required fields
+            required_fields = ['hostname', 'username', 'password', 
+                             'smtp_server', 'email_sender', 'email_receiver']
+            missing = [f for f in required_fields if f not in config]
+            if missing:
+                raise ValueError(f"Missing required config fields: {missing}")
+            
+            logger.info("Configuration decrypted successfully")
+            return config
+            
+        except Exception as e:
+            logger.error(f"Failed to decrypt configuration: {e}")
+            raise
+    
+    def test_connectivity(self) -> bool:
+        """Test SSH connectivity to target host"""
+        try:
+            sock = socket.create_connection(
+                (self.config['hostname'], 22), timeout=10
+            )
+            sock.close()
+            logger.info(f"SSH port reachable on {self.config['hostname']}")
+            return True
+        except Exception as e:
+            logger.error(f"Cannot reach SSH on {self.config['hostname']}: {e}")
+            return False
+    
+    def ssh_connect(self, max_retries: int = 3) -> Optional[paramiko.SSHClient]:
+        """Establish SSH connection with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    logger.info(f"Retry {attempt}/{max_retries} after {wait_time}s")
+                    time.sleep(wait_time)
                 
-                # Highlight Idle or Negotiation sessions with yellow background
-                table_html += f"<tr><td>{parts[0]}</td><td style='background-color:yellow;'>{parts[1]}</td><td>{parts[2]}</td><td>{parts[3]}</td></tr>"
+                client = paramiko.SSHClient()
                 
-                # If IPv4/IPv6 record is 0/0, the session should be reset
-                if ipv4v6_record[0] == 0 and ipv4v6_record[1] == 0:
-                    sessions_to_reset.append(session_ip)
-
-            elif state == "Established" and ipv4v6_record[0] > 0 and ipv4v6_record[1] > 0:
-                established_sessions.append(session_ip)
-                # Highlight Established sessions with green background
-                table_html += f"<tr><td>{parts[0]}</td><td style='background-color:lightgreen;'>{parts[1]}</td><td>{parts[2]}</td><td>{parts[3]}</td></tr>"
-
-            elif state == "Syn":
-                syn_sessions.append(session_ip)
-                # Highlight Syn sessions with orange background
-                table_html += f"<tr><td>{parts[0]}</td><td style='background-color:orange;'>{parts[1]}</td><td>{parts[2]}</td><td>{parts[3]}</td></tr>"
-            else:
-                table_html += f"<tr><td>{parts[0]}</td><td>{parts[1]}</td><td>{parts[2]}</td><td>{parts[3]}</td></tr>"
-    
-    table_html += "</tbody></table>"
-    return table_html, established_sessions, idle_sessions, negotiation_sessions, syn_sessions, sessions_to_reset
-
-# Function to check RPKI session status and reset sessions if necessary
-def check_rpki_session(hostname, username, password):
-    command = "display rpki session"
-    output = ssh_connect_and_execute(hostname, username, password, [command])
-
-    # Generate the HTML table and retrieve Established, Idle, Negotiation, Syn sessions, and those to reset
-    table_html, established_sessions, idle_sessions, negotiation_sessions, syn_sessions, sessions_to_reset = generate_rpki_table(output)
-
-    log = f"<b>RPKI session status</b>:<br><br>{table_html}<br>"
-
-    # Reset "Idle" or "Negotiation" sessions with IPv4/IPv6 record = 0
-    if sessions_to_reset:
-        log += f"<b>The following 'Idle' or 'Negotiation' sessions with IPv4/IPv6 record = 0 were reset</b>: {', '.join(sessions_to_reset)}<br>"
-        reset_sessions(hostname, username, password, sessions_to_reset)
-    
-    if idle_sessions or negotiation_sessions or syn_sessions:
-        log += f"<br><b>Warning</b>: There are 'Idle', 'Negotiation', or 'Syn' sessions, possible malfunction.<br>"
-
-    if established_sessions and not (idle_sessions or negotiation_sessions or syn_sessions):
-        # No issues found, so we return None to avoid sending an email
+                # Load known hosts if available
+                known_hosts_file = Path.home() / '.ssh' / 'known_hosts'
+                if known_hosts_file.exists():
+                    client.load_host_keys(str(known_hosts_file))
+                    client.set_missing_host_key_policy(paramiko.RejectPolicy())
+                else:
+                    # Fall back to AutoAddPolicy but log warning
+                    logger.warning("No known_hosts file found, using AutoAddPolicy")
+                    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                
+                client.connect(
+                    self.config['hostname'],
+                    username=self.config['username'],
+                    password=self.config['password'],
+                    timeout=30,
+                    banner_timeout=30,
+                    auth_timeout=30
+                )
+                
+                logger.info(f"SSH connection established to {self.config['hostname']}")
+                self.ssh_client = client
+                return client
+                
+            except paramiko.AuthenticationException as e:
+                logger.error(f"Authentication failed: {e}")
+                break  # Don't retry auth failures
+            except Exception as e:
+                logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    logger.error(f"Failed to connect after {max_retries} attempts")
+                    
         return None
+    
+    def execute_command(self, command: str, timeout: int = 30) -> Optional[str]:
+        """Execute command via SSH with proper output handling"""
+        if not self.ssh_client:
+            logger.error("No SSH connection available")
+            return None
+            
+        try:
+            stdin, stdout, stderr = self.ssh_client.exec_command(
+                command, timeout=timeout
+            )
+            
+            # Wait for command to complete
+            exit_status = stdout.channel.recv_exit_status()
+            
+            output = stdout.read().decode('utf-8', errors='ignore')
+            error = stderr.read().decode('utf-8', errors='ignore')
+            
+            if exit_status != 0:
+                logger.warning(f"Command returned non-zero exit status {exit_status}")
+                if error:
+                    logger.warning(f"Error output: {error}")
+            
+            return output
+            
+        except Exception as e:
+            logger.error(f"Failed to execute command '{command}': {e}")
+            return None
+    
+    def parse_rpki_output(self, output: str) -> Tuple[List[Dict], str]:
+        """Parse RPKI session output with improved error handling"""
+        sessions = []
+        
+        if not output:
+            logger.error("No output to parse")
+            return sessions, "<p>No data received from device</p>"
+        
+        lines = output.splitlines()
+        
+        # Find session data lines (containing IP addresses)
+        for line in lines:
+            # Match lines with IP addresses
+            if re.search(r'\d+\.\d+\.\d+\.\d+', line):
+                # Remove "Session:" prefix if present (NetEngine format)
+                line = re.sub(r'^Session:\s*', '', line.strip())
+                
+                # Try multiple parsing patterns
+                # Pattern 1: Standard format with multiple spaces
+                parts = re.split(r'\s{2,}', line.strip())
+                
+                if len(parts) >= 4:
+                    try:
+                        session = {
+                            'ip': parts[0],
+                            'state': parts[1],
+                            'age': parts[2] if len(parts) > 2 else 'N/A',
+                            'records': parts[3] if len(parts) > 3 else '0/0'
+                        }
+                        
+                        # Parse IPv4/IPv6 records
+                        if '/' in session['records']:
+                            ipv4, ipv6 = session['records'].split('/')
+                            session['ipv4_count'] = int(ipv4)
+                            session['ipv6_count'] = int(ipv6)
+                        else:
+                            session['ipv4_count'] = 0
+                            session['ipv6_count'] = 0
+                        
+                        sessions.append(session)
+                        logger.debug(f"Parsed session: {session}")
+                        
+                    except (ValueError, IndexError) as e:
+                        logger.warning(f"Failed to parse line: {line} - Error: {e}")
+        
+        # Generate HTML table
+        html = self.generate_html_table(sessions)
+        
+        return sessions, html
+    
+    def generate_html_table(self, sessions: List[Dict]) -> str:
+        """Generate HTML table with session status"""
+        if not sessions:
+            return "<p>No RPKI sessions found</p>"
+        
+        html = """
+        <style>
+            table { 
+                border-collapse: collapse; 
+                width: 100%; 
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                margin: 0;
+            }
+            th, td { 
+                border: 1px solid #e1e8f0; 
+                padding: 10px 12px; 
+                text-align: left;
+                font-size: 13px;
+            }
+            th { 
+                background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+                color: white; 
+                font-weight: 600;
+                text-transform: uppercase;
+                font-size: 12px;
+                letter-spacing: 0.5px;
+            }
+            tr:nth-child(even) { background-color: #f8f9fb; }
+            .established { 
+                background-color: #e6f4ea; 
+                color: #1e7e34;
+                font-weight: 500;
+            }
+            .idle { 
+                background-color: #fff3cd; 
+                color: #856404;
+                font-weight: 500;
+            }
+            .negotiation { 
+                background-color: #fff3cd; 
+                color: #856404;
+                font-weight: 500;
+            }
+            .syn { 
+                background-color: #ffeaa7; 
+                color: #d63031;
+                font-weight: 500;
+            }
+            .error { 
+                background-color: #ffe0e0; 
+                color: #dc3545;
+                font-weight: 500;
+            }
+        </style>
+        <table>
+            <thead>
+                <tr>
+                    <th>Session IP</th>
+                    <th>State</th>
+                    <th>Age</th>
+                    <th>IPv4/IPv6 Records</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        
+        for session in sessions:
+            state_class = session['state'].lower()
+            state_emoji = ''
+            
+            if state_class == 'established' and session['ipv4_count'] > 0:
+                state_class = 'established'
+                state_emoji = '🟢'
+            elif state_class == 'idle':
+                state_emoji = '⚠️'
+            elif state_class == 'negotiation':
+                state_class = 'negotiation'
+                state_emoji = '🔄'
+            elif state_class == 'syn':
+                state_class = 'syn'
+                state_emoji = '🟠'
+            else:
+                state_class = 'error'
+                state_emoji = '🔴'
+            
+            html += f"""
+                <tr class="{state_class}">
+                    <td>{state_emoji} {session['ip']}</td>
+                    <td>{session['state']}</td>
+                    <td>{session['age']}</td>
+                    <td>{session['records']}</td>
+                </tr>
+            """
+        
+        html += """
+            </tbody>
+        </table>
+        """
+        
+        return html
+    
+    def parse_age_to_minutes(self, age_str: str) -> int:
+        """Parse age string (e.g., '01h14m46s', '6d02h12m51s') to minutes"""
+        try:
+            total_minutes = 0
+            
+            # Parse days
+            if 'd' in age_str:
+                days_part = age_str.split('d')[0]
+                total_minutes += int(days_part) * 24 * 60
+                age_str = age_str.split('d')[1]
+            
+            # Parse hours
+            if 'h' in age_str:
+                hours_part = age_str.split('h')[0]
+                total_minutes += int(hours_part) * 60
+                age_str = age_str.split('h')[1]
+            
+            # Parse minutes
+            if 'm' in age_str:
+                minutes_part = age_str.split('m')[0]
+                total_minutes += int(minutes_part)
+            
+            return total_minutes
+            
+        except Exception as e:
+            logger.warning(f"Could not parse age string '{age_str}': {e}")
+            return 0
+    
+    def analyze_sessions(self, sessions: List[Dict]) -> Dict:
+        """Analyze session status and determine if action is needed"""
+        analysis = {
+            'total': len(sessions),
+            'established': [],
+            'idle': [],
+            'negotiation': [],
+            'syn': [],
+            'need_reset': [],
+            'healthy': True,
+            'issues': []
+        }
+        
+        NEGOTIATION_TIMEOUT_MINUTES = 30  # Reset if in negotiation for more than 30 minutes
+        
+        for session in sessions:
+            state = session['state'].lower()
+            
+            if state == 'established' and session['ipv4_count'] > 0:
+                analysis['established'].append(session['ip'])
+            elif state == 'idle':
+                analysis['idle'].append(session['ip'])
+                if session['ipv4_count'] == 0 and session['ipv6_count'] == 0:
+                    analysis['need_reset'].append(session['ip'])
+            elif state == 'negotiation':
+                analysis['negotiation'].append(session['ip'])
+                
+                # Check how long it's been in negotiation
+                age_minutes = self.parse_age_to_minutes(session.get('age', '0'))
+                
+                # Reset if: no records OR stuck in negotiation for too long
+                if (session['ipv4_count'] == 0 and session['ipv6_count'] == 0) or \
+                   (age_minutes > NEGOTIATION_TIMEOUT_MINUTES):
+                    analysis['need_reset'].append(session['ip'])
+                    logger.warning(f"Session {session['ip']} stuck in Negotiation for {session.get('age')} ({age_minutes} minutes) - will reset")
+            elif state == 'syn':
+                analysis['syn'].append(session['ip'])
+        
+        # Determine health status
+        if analysis['idle'] or analysis['negotiation'] or analysis['syn']:
+            analysis['healthy'] = False
+            
+            if analysis['idle']:
+                analysis['issues'].append(f"{len(analysis['idle'])} idle sessions")
+            if analysis['negotiation']:
+                analysis['issues'].append(f"{len(analysis['negotiation'])} negotiating sessions")
+            if analysis['syn']:
+                analysis['issues'].append(f"{len(analysis['syn'])} syn sessions")
+        
+        return analysis
+    
+    def reset_sessions(self, sessions_to_reset: List[str]) -> bool:
+        """Reset specified RPKI sessions"""
+        if self.test_mode:
+            logger.info(f"TEST MODE: Would reset sessions: {sessions_to_reset}")
+            return True
+        
+        success = True
+        for session_ip in sessions_to_reset:
+            command = f"reset rpki session {session_ip}"
+            logger.info(f"Resetting session: {session_ip}")
+            
+            result = self.execute_command(command)
+            if result is None:
+                logger.error(f"Failed to reset session {session_ip}")
+                success = False
+            else:
+                logger.info(f"Session {session_ip} reset command sent")
+        
+        return success
+    
+    def send_alert_email(self, subject: str, body: str) -> bool:
+        """Send alert email with improved error handling"""
+        if self.test_mode:
+            logger.info(f"TEST MODE: Would send email with subject: {subject}")
+            print(f"\n--- Email Preview ---\nSubject: {subject}\nBody:\n{body[:500]}...")
+            return True
+        
+        try:
+            msg = MIMEMultipart("alternative")
+            msg['From'] = self.config['email_sender']
+            msg['To'] = self.config['email_receiver']
+            msg['Subject'] = subject
+            msg['Date'] = email.utils.formatdate(localtime=True)
+            
+            # Add both plain text and HTML parts
+            text_part = MIMEText(re.sub('<[^<]+?>', '', body), 'plain')
+            html_part = MIMEText(body, 'html')
+            
+            msg.attach(text_part)
+            msg.attach(html_part)
+            
+            # Connect to SMTP server
+            smtp_port = int(self.config.get('smtp_port', 587))
+            
+            with smtplib.SMTP(self.config['smtp_server'], smtp_port, timeout=30) as server:
+                server.set_debuglevel(0)  # Set to 1 for SMTP debug output
+                
+                # Start TLS if not using port 25
+                if smtp_port != 25:
+                    server.starttls()
+                
+                # Authenticate if credentials provided
+                if self.config.get('smtp_username') and self.config.get('smtp_password'):
+                    server.login(self.config['smtp_username'], self.config['smtp_password'])
+                
+                # Send email
+                server.send_message(msg)
+                
+            logger.info(f"Alert email sent successfully to {self.config['email_receiver']}")
+            return True
+            
+        except smtplib.SMTPAuthenticationError as e:
+            logger.error(f"SMTP authentication failed: {e}")
+        except smtplib.SMTPException as e:
+            logger.error(f"SMTP error occurred: {e}")
+        except Exception as e:
+            logger.error(f"Failed to send email: {e}")
+        
+        return False
+    
+    def should_send_alert(self, analysis: Dict) -> bool:
+        """Determine if an alert should be sent based on state and history"""
+        if analysis['healthy']:
+            return False
+        
+        # Always alert in test mode
+        if self.test_mode:
+            return True
+        
+        # Check if we've already alerted recently (within 1 hour)
+        if self.state.get('last_alert'):
+            try:
+                last_alert = datetime.fromisoformat(self.state['last_alert'])
+                if (datetime.now() - last_alert).total_seconds() < 3600:
+                    logger.info("Alert suppressed (sent within last hour)")
+                    return False
+            except:
+                pass
+        
+        return True
+    
+    def check_for_recovery(self, current_analysis: Dict) -> bool:
+        """Check if sessions have recovered from previous issues"""
+        if not self.state.get('previous_analysis'):
+            return False
+        
+        prev = self.state['previous_analysis']
+        
+        # Check if we had issues before but not now
+        if not prev.get('healthy', True) and current_analysis['healthy']:
+            return True
+        
+        # Check if specific sessions recovered
+        prev_issues = set(prev.get('idle', [])) | set(prev.get('negotiation', [])) | set(prev.get('syn', []))
+        curr_established = set(current_analysis.get('established', []))
+        
+        # Sessions that were problematic but are now established
+        recovered = prev_issues & curr_established
+        
+        return len(recovered) > 0
+    
+    def should_send_recovery_alert(self) -> bool:
+        """Check if we should send a recovery alert"""
+        # Always send in test mode
+        if self.test_mode:
+            return True
+        
+        # Don't send recovery alerts too frequently (wait at least 30 minutes)
+        if self.state.get('last_recovery_alert'):
+            try:
+                last_recovery = datetime.fromisoformat(self.state['last_recovery_alert'])
+                if (datetime.now() - last_recovery).total_seconds() < 1800:
+                    logger.info("Recovery alert suppressed (sent within last 30 minutes)")
+                    return False
+            except:
+                pass
+        
+        return True
+    
+    def run_check(self) -> bool:
+        """Main check routine"""
+        logger.info("="*50)
+        logger.info(f"Starting RPKI check at {datetime.now()}")
+        
+        try:
+            # Test connectivity first
+            if not self.test_connectivity():
+                self.state['consecutive_failures'] += 1
+                self.save_state()
+                return False
+            
+            # Connect via SSH
+            if not self.ssh_connect():
+                self.state['consecutive_failures'] += 1
+                self.save_state()
+                return False
+            
+            # Execute RPKI command
+            output = self.execute_command("display rpki session")
+            if not output:
+                logger.error("No output received from RPKI command")
+                self.state['consecutive_failures'] += 1
+                self.save_state()
+                return False
+            
+            # Parse output
+            sessions, html_table = self.parse_rpki_output(output)
+            
+            # Analyze sessions
+            analysis = self.analyze_sessions(sessions)
+            
+            logger.info(f"Analysis: {analysis['total']} total sessions, "
+                       f"{len(analysis['established'])} established, "
+                       f"{len(analysis['idle'])} idle, "
+                       f"{len(analysis['negotiation'])} negotiating")
+            
+            # Reset sessions if needed
+            if analysis['need_reset']:
+                logger.warning(f"Sessions need reset: {analysis['need_reset']}")
+                self.reset_sessions(analysis['need_reset'])
+            
+            # Check for recovery and send recovery notification
+            if self.check_for_recovery(analysis) and self.should_send_recovery_alert():
+                # Get recovered sessions
+                prev = self.state.get('previous_analysis', {})
+                prev_issues = set(prev.get('idle', [])) | set(prev.get('negotiation', [])) | set(prev.get('syn', []))
+                curr_established = set(analysis.get('established', []))
+                recovered_sessions = prev_issues & curr_established
+                
+                subject = f"[RPKI Monitor] ✅ Recovery: Sessions Restored"
+                
+                # Create recovery email
+                body = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="UTF-8">
+                    <style>
+                        body {{
+                            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                            line-height: 1.3;
+                            color: #333;
+                            background-color: #f5f7fa;
+                            margin: 0;
+                            padding: 0;
+                        }}
+                        .container {{
+                            max-width: 800px;
+                            margin: 0 auto;
+                            background: white;
+                            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                        }}
+                        .header-block {{
+                            background: #1e3c72;
+                            color: white;
+                            padding: 15px 20px;
+                            border-bottom: 3px solid #28a745;
+                        }}
+                        .header-block h1 {{
+                            margin: 0;
+                            font-size: 20px;
+                            font-weight: 400;
+                        }}
+                        .header-block .subtitle {{
+                            font-size: 12px;
+                            color: #b8d4f1;
+                            margin: 0;
+                        }}
+                        .recovery-text {{
+                            color: #90ee90;
+                            font-weight: bold;
+                            font-size: 13px;
+                        }}
+                        .content {{
+                            padding: 15px 20px;
+                        }}
+                        .info-grid {{
+                            display: grid;
+                            grid-template-columns: 1fr 1fr;
+                            gap: 10px;
+                            margin: 10px 0;
+                            padding: 10px;
+                            background: #f8f9fb;
+                            border-radius: 4px;
+                            font-size: 13px;
+                        }}
+                        .info-item {{
+                            display: flex;
+                            align-items: center;
+                        }}
+                        .info-label {{
+                            font-weight: 600;
+                            color: #1e3c72;
+                            margin-right: 6px;
+                        }}
+                        .section-title {{
+                            color: #1e3c72;
+                            border-bottom: 1px solid #e1e8f0;
+                            padding-bottom: 2px;
+                            margin: 10px 0 0 0;
+                            font-size: 14px;
+                        }}
+                        .footer {{
+                            background: #1e3c72;
+                            color: #b8d4f1;
+                            padding: 10px;
+                            text-align: center;
+                            font-size: 11px;
+                        }}
+                        .footer a {{
+                            color: #fff;
+                            text-decoration: none;
+                        }}
+                        .success-box {{
+                            background: #d4edda;
+                            border-left: 3px solid #28a745;
+                            padding: 8px 10px;
+                            margin: 10px 0;
+                            border-radius: 3px;
+                            font-size: 13px;
+                        }}
+                        ul {{
+                            margin: 5px 0;
+                            padding-left: 20px;
+                        }}
+                        li {{
+                            margin: 3px 0;
+                        }}
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <div class="header-block">
+                            <div style="line-height: 1.2;">
+                                <h1 style="margin: 0;">HUAWEI RPKI MONITOR v2.0</h1>
+                                <div class="subtitle">Session Monitoring System</div>
+                                <div class="recovery-text">✅ SESSIONS RECOVERED</div>
+                            </div>
+                        </div>
+                        
+                        <div class="content">
+                            <div class="info-grid">
+                                <div class="info-item">
+                                    <span class="info-label">🕐 Time:</span>
+                                    <span>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} CET</span>
+                                </div>
+                                <div class="info-item">
+                                    <span class="info-label">🖥 Device:</span>
+                                    <span>{self.config['hostname']}</span>
+                                </div>
+                                <div class="info-item">
+                                    <span class="info-label">✅ Status:</span>
+                                    <span style="color: #28a745; font-weight: bold;">ALL SESSIONS HEALTHY</span>
+                                </div>
+                                <div class="info-item">
+                                    <span class="info-label">🔄 Recovered:</span>
+                                    <span style="color: #28a745; font-weight: bold;">{len(recovered_sessions)} sessions</span>
+                                </div>
+                            </div>
+                            
+                            <div style="background: #f0f4f8; padding: 8px; border-radius: 4px; margin: 10px 0; font-size: 13px; text-align: center;">
+                                <strong style="color: #28a745;">Current Status:</strong>
+                                &nbsp;&nbsp;Total: <strong>{analysis['total']}</strong>
+                                &nbsp;&nbsp;|&nbsp;&nbsp;
+                                <span style="color: #28a745;">✓ Established: <strong>{len(analysis['established'])}</strong></span>
+                                &nbsp;&nbsp;|&nbsp;&nbsp;
+                                <span style="color: #6c757d;">Idle: <strong>{len(analysis['idle'])}</strong></span>
+                                &nbsp;&nbsp;|&nbsp;&nbsp;
+                                <span style="color: #6c757d;">Negotiating: <strong>{len(analysis['negotiation'])}</strong></span>
+                            </div>
+                            
+                            <h2 class="section-title">📊 Session Details</h2>
+                            {html_table}
+                            
+                            <div class="success-box">
+                                <strong>✅ Recovery Details:</strong>
+                                <ul>
+                                    {''.join([f'<li>Session {ip} is now established and operational</li>' for ip in recovered_sessions])}
+                                </ul>
+                            </div>
+                            
+                            <div class="success-box">
+                                <strong>📝 Summary:</strong>
+                                <ul>
+                                    <li>RPKI sessions have been successfully restored</li>
+                                    <li>All BGP prefixes are now being validated</li>
+                                    <li>No further action required</li>
+                                </ul>
+                            </div>
+                        </div>
+                        
+                        <div class="footer">
+                            <strong>GOLINE SA</strong> | Via Croce Campagna 2, 6855 Stabio, Switzerland | 📧 <a href="mailto:noc@goline.ch">noc@goline.ch</a><br>
+                            <span style="opacity: 0.8;">Automated recovery notification from HuaweiRPKICheck_v2.py</span>
+                        </div>
+                    </div>
+                </body>
+                </html>
+                """
+                
+                if self.send_alert_email(subject, body):
+                    self.state['last_recovery_alert'] = datetime.now().isoformat()
+                    logger.info(f"Recovery notification sent for {len(recovered_sessions)} sessions")
+            
+            # Send alert if needed
+            elif not analysis['healthy'] and self.should_send_alert(analysis):
+                subject = f"[RPKI Monitor] Alert: {', '.join(analysis['issues'])}"
+                
+                # Create professional HTML email with GOLINE branding
+                body = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="UTF-8">
+                    <style>
+                        body {{
+                            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                            line-height: 1.3;
+                            color: #333;
+                            background-color: #f5f7fa;
+                            margin: 0;
+                            padding: 0;
+                        }}
+                        .container {{
+                            max-width: 800px;
+                            margin: 0 auto;
+                            background: white;
+                            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                        }}
+                        .header-block {{
+                            background: #1e3c72;
+                            color: white;
+                            padding: 15px 20px;
+                            border-bottom: 3px solid #dc3545;
+                        }}
+                        .header-block h1 {{
+                            margin: 0;
+                            font-size: 20px;
+                            font-weight: 400;
+                        }}
+                        .header-block .subtitle {{
+                            font-size: 12px;
+                            color: #b8d4f1;
+                            margin: 0;
+                        }}
+                        .alert-text {{
+                            color: #ffeb3b;
+                            font-weight: bold;
+                            font-size: 13px;
+                        }}
+                        .content {{
+                            padding: 15px 20px;
+                        }}
+                        .info-grid {{
+                            display: grid;
+                            grid-template-columns: 1fr 1fr;
+                            gap: 10px;
+                            margin: 10px 0;
+                            padding: 10px;
+                            background: #f8f9fb;
+                            border-radius: 4px;
+                            font-size: 13px;
+                        }}
+                        .info-item {{
+                            display: flex;
+                            align-items: center;
+                        }}
+                        .info-label {{
+                            font-weight: 600;
+                            color: #1e3c72;
+                            margin-right: 6px;
+                        }}
+                        .section-title {{
+                            color: #1e3c72;
+                            border-bottom: 1px solid #e1e8f0;
+                            padding-bottom: 2px;
+                            margin: 10px 0 0 0;
+                            font-size: 14px;
+                        }}
+                        .footer {{
+                            background: #1e3c72;
+                            color: #b8d4f1;
+                            padding: 10px;
+                            text-align: center;
+                            font-size: 11px;
+                        }}
+                        .footer a {{
+                            color: #fff;
+                            text-decoration: none;
+                        }}
+                        .warning-box {{
+                            background: #fff3cd;
+                            border-left: 3px solid #ffc107;
+                            padding: 8px 10px;
+                            margin: 10px 0;
+                            border-radius: 3px;
+                            font-size: 13px;
+                        }}
+                        .success-box {{
+                            background: #d4edda;
+                            border-left: 3px solid #28a745;
+                            padding: 8px 10px;
+                            margin: 10px 0;
+                            border-radius: 3px;
+                            font-size: 13px;
+                        }}
+                        ul {{
+                            margin: 5px 0;
+                            padding-left: 20px;
+                        }}
+                        li {{
+                            margin: 3px 0;
+                        }}
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <div class="header-block">
+                            <div style="line-height: 1.2;">
+                                <h1 style="margin: 0;">HUAWEI RPKI MONITOR v2.0</h1>
+                                <div class="subtitle">Session Monitoring System</div>
+                                <div class="alert-text">⚠ ANOMALY DETECTED</div>
+                            </div>
+                        </div>
+                        
+                        <div class="content">
+                            <div class="info-grid">
+                                <div class="info-item">
+                                    <span class="info-label">🕐 Time:</span>
+                                    <span>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} CET</span>
+                                </div>
+                                <div class="info-item">
+                                    <span class="info-label">🖥 Device:</span>
+                                    <span>{self.config['hostname']}</span>
+                                </div>
+                                <div class="info-item">
+                                    <span class="info-label">⚠ Issues:</span>
+                                    <span style="color: #dc3545; font-weight: bold;">{', '.join(analysis['issues'])}</span>
+                                </div>
+                                <div class="info-item">
+                                    <span class="info-label">🔴 Severity:</span>
+                                    <span style="color: #dc3545; font-weight: bold;">HIGH</span>
+                                </div>
+                            </div>
+                            
+                            <div style="background: #f0f4f8; padding: 8px; border-radius: 4px; margin: 10px 0; font-size: 13px; text-align: center;">
+                                <strong style="color: #1e3c72;">Sessions:</strong>
+                                &nbsp;&nbsp;Total: <strong>{analysis['total']}</strong>
+                                &nbsp;&nbsp;|&nbsp;&nbsp;
+                                <span style="color: #28a745;">✓ OK: <strong>{len(analysis['established'])}</strong></span>
+                                &nbsp;&nbsp;|&nbsp;&nbsp;
+                                <span style="color: #ffc107;">⚠ Idle: <strong>{len(analysis['idle'])}</strong></span>
+                                &nbsp;&nbsp;|&nbsp;&nbsp;
+                                <span style="color: #fd7e14;">🔄 Negotiating: <strong>{len(analysis['negotiation'])}</strong></span>
+                                &nbsp;&nbsp;|&nbsp;&nbsp;
+                                <span style="color: #dc3545;">🔶 SYN: <strong>{len(analysis['syn'])}</strong></span>
+                            </div>
+                            
+                            <h2 class="section-title">📊 Session Details</h2>
+                            {html_table}
+                            
+                            {'<div class="success-box"><strong>✓ Automatic Recovery:</strong> Sessions reset: ' + ', '.join(analysis['need_reset']) + '</div>' if analysis['need_reset'] else ''}
+                            
+                            <div class="warning-box">
+                                <strong>💡 Recommended Actions:</strong>
+                                <ul>
+                                    <li>Review RPKI server connectivity</li>
+                                    <li>Check BGP peering status</li>
+                                    <li>Verify network path to RPKI validators</li>
+                                    <li>Monitor for recurring issues</li>
+                                </ul>
+                            </div>
+                        </div>
+                        
+                        <div class="footer">
+                            <strong>GOLINE SA</strong> | Via Croce Campagna 2, 6855 Stabio, Switzerland | 📧 <a href="mailto:noc@goline.ch">noc@goline.ch</a><br>
+                            <span style="opacity: 0.8;">Automated alert from HuaweiRPKICheck_v2.py</span>
+                        </div>
+                    </div>
+                </body>
+                </html>
+                """
+                
+                if self.send_alert_email(subject, body):
+                    self.state['last_alert'] = datetime.now().isoformat()
+            
+            # Update state with current analysis for next comparison
+            self.state['consecutive_failures'] = 0
+            self.state['previous_analysis'] = {
+                'healthy': analysis['healthy'],
+                'established': analysis['established'],
+                'idle': analysis['idle'],
+                'negotiation': analysis['negotiation'],
+                'syn': analysis['syn'],
+                'total': analysis['total']
+            }
+            self.save_state()
+            
+            logger.info("RPKI check completed successfully")
+            return True
+            
+        except Exception as e:
+            logger.exception(f"Unexpected error during check: {e}")
+            self.state['consecutive_failures'] += 1
+            self.save_state()
+            return False
+            
+        finally:
+            # Clean up SSH connection
+            if self.ssh_client:
+                try:
+                    self.ssh_client.close()
+                except:
+                    pass
 
-    return log
+# Import email.utils for email date formatting
+import email.utils
 
-# Function to reset RPKI sessions
-def reset_sessions(hostname, username, password, sessions_to_reset):
-    for session in sessions_to_reset:
-        command = f"reset rpki session {session}"
-        ssh_connect_and_execute(hostname, username, password, [command])
-
-# Function to send email
-def send_email(smtp_server, smtp_username, smtp_password, sender_email, receiver_email, subject, body):
-    msg = MIMEMultipart("alternative")
-    msg['From'] = sender_email
-    msg['To'] = receiver_email
-    msg['Subject'] = subject
-
-    # Convert body to HTML
-    msg.attach(MIMEText(body, 'html'))
-
+def main():
+    """Main entry point with argument parsing"""
+    parser = argparse.ArgumentParser(description='Huawei RPKI Session Checker v2.0')
+    parser.add_argument('--test', action='store_true', help='Run in test mode (no changes, no emails)')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
+    parser.add_argument('--config', type=str, default=str(CONFIG_FILE), help='Path to config file')
+    parser.add_argument('--key', type=str, default=str(SECRET_KEY_FILE), help='Path to key file')
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    global logger
+    logger = setup_logging(verbose=args.verbose)
+    
+    if args.test:
+        logger.info("Running in TEST MODE - no changes will be made")
+    
     try:
-        with smtplib.SMTP(smtp_server, 587) as server:  # Assuming use of TLS
-            server.starttls()
-            server.login(smtp_username, smtp_password)  # SMTP Authentication
-            server.sendmail(sender_email, receiver_email, msg.as_string())
+        # Create checker instance
+        checker = RPKIChecker({}, test_mode=args.test)
+        
+        # Load and decrypt configuration
+        config = checker.decrypt_config(Path(args.key), Path(args.config))
+        checker.config = config
+        
+        # Run the check
+        success = checker.run_check()
+        
+        sys.exit(0 if success else 1)
+        
     except Exception as e:
-        pass  # Optionally handle the error without printing it
+        logger.exception(f"Fatal error: {e}")
+        sys.exit(2)
 
-# Main script
 if __name__ == "__main__":
-    # Load the key and decrypt the configuration file
-    key = open("secret.key", "rb").read()
-    config = decrypt_data(key, "HuaweiRPKICheck.conf")
-
-    hostname = config["hostname"]
-    username = config["username"]
-    password = config["password"]
-    smtp_server = config["smtp_server"]
-    smtp_username = config["smtp_username"]
-    smtp_password = config["smtp_password"]
-    email_sender = config["email_sender"]
-    email_receiver = config["email_receiver"]
-
-    # Check RPKI session status and generate log
-    log = check_rpki_session(hostname, username, password)
-
-    # Only send the email if there are issues
-    if log:
-        # Email subject and body
-        subject = "RPKI Session Status Report"
-        body = log
-
-        # Send the email
-        send_email(smtp_server, smtp_username, smtp_password, email_sender, email_receiver, subject, body)
+    main()
