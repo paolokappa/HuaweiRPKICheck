@@ -151,6 +151,67 @@ crontab -e
 
 ---
 
+## 🔐 Credential Management
+
+### HuaweiRPKI_credgen.py - Credential Encryption Tool
+
+This utility securely encrypts your sensitive credentials before storage. Never store passwords in plain text!
+
+#### Usage
+
+1. **Create your configuration file** with plain text credentials:
+```bash
+nano HuaweiRPKICheck.conf
+```
+
+2. **Add your configuration** (example):
+```ini
+hostname=192.168.1.1
+username=admin
+password=YourRouterPassword
+smtp_server=mail.company.com
+smtp_port=587
+smtp_username=rpki@company.com
+smtp_password=YourSMTPPassword
+email_sender=rpki@company.com
+email_receiver=noc@company.com
+```
+
+3. **Run the encryption tool**:
+```bash
+python3 HuaweiRPKI_credgen.py
+```
+
+4. **Output files generated**:
+   - `secret.key` - AES encryption key (⚠️ KEEP THIS SECURE!)
+   - `HuaweiRPKICheck.conf` - Encrypted configuration (safe to backup)
+
+#### Security Notes
+
+- The original plain text configuration is automatically overwritten with encrypted data
+- Store `secret.key` in a secure location with restricted permissions (chmod 600)
+- Never commit `secret.key` to version control
+- Backup both `secret.key` and encrypted config - you need both to run the script
+- If you lose `secret.key`, you'll need to recreate the configuration
+
+#### How It Works
+
+```python
+# The tool uses Fernet (symmetric encryption)
+from cryptography.fernet import Fernet
+
+# 1. Generates a unique encryption key
+key = Fernet.generate_key()
+
+# 2. Encrypts your configuration
+fernet = Fernet(key)
+encrypted_data = fernet.encrypt(config_data.encode())
+
+# 3. Saves encrypted config and key separately
+```
+
+---
+
 ## ⚙️ Configuration
 
 ### Configuration Parameters
@@ -403,7 +464,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ```
 MIT License
 
-Copyright (c) 2024 Paolo Kappa / GOLINE SA
+Copyright (c) 2024 Paolo Caparrelli / GOLINE SA
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -439,7 +500,7 @@ For enterprise support, custom development, or training:
 
 <div align="center">
 
-### Built with ❤️ by [Paolo Kappa](https://github.com/paolokappa)
+### Built with ❤️ by [Paolo Caparrelli](https://github.com/paolokappa)
 
 *Ensuring routing security, one session at a time*
 
