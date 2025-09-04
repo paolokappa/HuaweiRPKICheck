@@ -1,13 +1,15 @@
-# HuaweiRPKICheck v2.0
+# HuaweiRPKICheck v3.0
 
 This project provides an automated monitoring and recovery system for Huawei NetEngine RPKI sessions. The main purpose is to address a known issue with Huawei NetEngine routers where RPKI sessions fail to automatically reset when the RPKI server becomes available after an outage.
 
-## 🆕 What's New in v2.0
+## 🆕 What's New in v3.0
 
-### Major Enhancements
-- **🔄 Automatic Recovery Detection**: Now sends notifications when sessions recover from problematic states
+### Major Enhancements v3.0
+- **🔌 Interactive SSH Shell**: Improved connection stability with interactive shell support for Huawei devices
+- **🚨 Critical Alert System**: Differentiated alert frequencies - every 30 minutes for critical (all down), 60 minutes for warnings
+- **🔄 Automatic Recovery Detection**: Sends notifications when sessions recover from problematic states
 - **⏰ Smart Timeout Management**: Automatically resets sessions stuck in Negotiation for more than 5 minutes
-- **📧 Improved Email Templates**: Professional HTML emails with consistent styling and better readability
+- **📧 Professional Email Templates**: GOLINE-branded HTML emails with consistent styling and severity indicators
 - **📊 Enhanced State Tracking**: Persistent state management to track session history and prevent duplicate alerts
 - **🎨 Visual Status Indicators**: Color-coded session states with emoji indicators for quick status identification
 

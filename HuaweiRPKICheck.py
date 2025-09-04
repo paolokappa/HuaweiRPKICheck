@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Huawei RPKI Check v2.0 - Enhanced version with improved error handling and logging
-Maintains backward compatibility while adding robustness and monitoring capabilities
+Huawei RPKI Check v3.0 - Enhanced version with interactive SSH shell support
+Improved connection stability and command execution for Huawei devices
 """
 
 import paramiko
@@ -21,6 +21,8 @@ from email.mime.multipart import MIMEMultipart
 import re
 import socket
 from pathlib import Path
+import threading
+import select
 
 # Configuration
 BASE_DIR = Path("/opt/HuaweiRPKICheck")
@@ -69,13 +71,191 @@ import logging.handlers
 
 logger = setup_logging()
 
+class InteractiveSSH:
+    """Interactive SSH session handler for Huawei devices"""
+    
+    def __init__(self, hostname: str, username: str, password: str):
+        self.hostname = hostname
+        self.username = username
+        self.password = password
+        self.client = None
+        self.channel = None
+        self.prompt_pattern = r'[<\[].*?[>\]]'  # Matches Huawei prompts like <hostname> or [hostname]
+        
+    def connect(self, timeout: int = 30) -> bool:
+        """Establish interactive SSH connection"""
+        try:
+            # Close any existing connection
+            self.disconnect()
+            
+            # Create new SSH client
+            self.client = paramiko.SSHClient()
+            
+            # Load known hosts if available
+            known_hosts_file = Path.home() / '.ssh' / 'known_hosts'
+            if known_hosts_file.exists():
+                self.client.load_host_keys(str(known_hosts_file))
+                self.client.set_missing_host_key_policy(paramiko.RejectPolicy())
+            else:
+                logger.warning("No known_hosts file found, using AutoAddPolicy")
+                self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            
+            # Connect to the device
+            logger.info(f"Connecting to {self.hostname}...")
+            self.client.connect(
+                self.hostname,
+                username=self.username,
+                password=self.password,
+                timeout=timeout,
+                banner_timeout=timeout,
+                auth_timeout=timeout,
+                look_for_keys=False,
+                allow_agent=False
+            )
+            
+            # Get transport and set keepalive
+            transport = self.client.get_transport()
+            transport.set_keepalive(15)  # Send keepalive every 15 seconds
+            
+            # Open interactive shell channel
+            self.channel = self.client.invoke_shell(
+                width=200,
+                height=100
+            )
+            
+            # Set channel timeout
+            self.channel.settimeout(5.0)
+            
+            # Wait for initial prompt
+            time.sleep(2)
+            initial_output = self._read_until_prompt(timeout=10)
+            logger.debug(f"Initial prompt received: {initial_output[-100:] if initial_output else 'None'}")
+            
+            # Disable paging to get full output
+            self._send_command_raw("screen-length 0 temporary", wait_for_prompt=True)
+            
+            logger.info(f"Interactive SSH session established to {self.hostname}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to establish interactive SSH connection: {e}")
+            self.disconnect()
+            return False
+    
+    def disconnect(self):
+        """Close SSH connection"""
+        try:
+            if self.channel:
+                self.channel.close()
+                self.channel = None
+            if self.client:
+                self.client.close()
+                self.client = None
+            logger.debug("SSH connection closed")
+        except:
+            pass
+    
+    def _read_until_prompt(self, timeout: int = 10) -> str:
+        """Read output until prompt is detected"""
+        output = ""
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            if self.channel.recv_ready():
+                chunk = self.channel.recv(4096).decode('utf-8', errors='ignore')
+                output += chunk
+                
+                # Check if we've received a prompt
+                if re.search(self.prompt_pattern, output.split('\n')[-1]):
+                    break
+            else:
+                time.sleep(0.1)
+        
+        return output
+    
+    def _send_command_raw(self, command: str, wait_for_prompt: bool = True) -> str:
+        """Send command and optionally wait for response"""
+        if not self.channel:
+            logger.error("No active channel for command execution")
+            return ""
+        
+        try:
+            # Clear any pending data
+            while self.channel.recv_ready():
+                self.channel.recv(4096)
+            
+            # Send command
+            self.channel.send(command + '\n')
+            logger.debug(f"Sent command: {command}")
+            
+            if wait_for_prompt:
+                # Read response until prompt
+                output = self._read_until_prompt()
+                
+                # Remove the command echo and prompt from output
+                lines = output.split('\n')
+                if len(lines) > 1:
+                    # Remove first line (command echo) and last line (prompt)
+                    cleaned_lines = lines[1:-1]
+                    return '\n'.join(cleaned_lines)
+                
+                return output
+            
+            return ""
+            
+        except Exception as e:
+            logger.error(f"Failed to send command '{command}': {e}")
+            return ""
+    
+    def execute_command(self, command: str, timeout: int = 30) -> Optional[str]:
+        """Execute command and return output"""
+        if not self.is_active():
+            logger.warning("SSH session not active, reconnecting...")
+            if not self.connect():
+                return None
+        
+        try:
+            output = self._send_command_raw(command, wait_for_prompt=True)
+            logger.debug(f"Command '{command}' output length: {len(output) if output else 0}")
+            return output
+            
+        except Exception as e:
+            logger.error(f"Error executing command '{command}': {e}")
+            # Try to reconnect once
+            logger.info("Attempting to reconnect...")
+            if self.connect():
+                try:
+                    output = self._send_command_raw(command, wait_for_prompt=True)
+                    return output
+                except Exception as e2:
+                    logger.error(f"Failed again after reconnect: {e2}")
+            
+            return None
+    
+    def is_active(self) -> bool:
+        """Check if SSH connection is active"""
+        if not self.client or not self.channel:
+            return False
+        
+        try:
+            transport = self.client.get_transport()
+            if transport and transport.is_active() and not self.channel.closed:
+                # Send a small test to verify channel is responsive
+                transport.send_ignore()
+                return True
+        except:
+            pass
+        
+        return False
+
+
 class RPKIChecker:
-    """Main class for RPKI session checking with improved error handling"""
+    """Main class for RPKI session checking with interactive SSH"""
     
     def __init__(self, config: Dict[str, str], test_mode: bool = False):
         self.config = config
         self.test_mode = test_mode
-        self.ssh_client = None
+        self.ssh = None
         self.state = self.load_state()
         self.session_history = []
         
@@ -150,78 +330,6 @@ class RPKIChecker:
             logger.error(f"Cannot reach SSH on {self.config['hostname']}: {e}")
             return False
     
-    def ssh_connect(self, max_retries: int = 3) -> Optional[paramiko.SSHClient]:
-        """Establish SSH connection with retry logic"""
-        for attempt in range(max_retries):
-            try:
-                if attempt > 0:
-                    wait_time = 2 ** attempt  # Exponential backoff
-                    logger.info(f"Retry {attempt}/{max_retries} after {wait_time}s")
-                    time.sleep(wait_time)
-                
-                client = paramiko.SSHClient()
-                
-                # Load known hosts if available
-                known_hosts_file = Path.home() / '.ssh' / 'known_hosts'
-                if known_hosts_file.exists():
-                    client.load_host_keys(str(known_hosts_file))
-                    client.set_missing_host_key_policy(paramiko.RejectPolicy())
-                else:
-                    # Fall back to AutoAddPolicy but log warning
-                    logger.warning("No known_hosts file found, using AutoAddPolicy")
-                    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                
-                client.connect(
-                    self.config['hostname'],
-                    username=self.config['username'],
-                    password=self.config['password'],
-                    timeout=30,
-                    banner_timeout=30,
-                    auth_timeout=30
-                )
-                
-                logger.info(f"SSH connection established to {self.config['hostname']}")
-                self.ssh_client = client
-                return client
-                
-            except paramiko.AuthenticationException as e:
-                logger.error(f"Authentication failed: {e}")
-                break  # Don't retry auth failures
-            except Exception as e:
-                logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
-                if attempt == max_retries - 1:
-                    logger.error(f"Failed to connect after {max_retries} attempts")
-                    
-        return None
-    
-    def execute_command(self, command: str, timeout: int = 30) -> Optional[str]:
-        """Execute command via SSH with proper output handling"""
-        if not self.ssh_client:
-            logger.error("No SSH connection available")
-            return None
-            
-        try:
-            stdin, stdout, stderr = self.ssh_client.exec_command(
-                command, timeout=timeout
-            )
-            
-            # Wait for command to complete
-            exit_status = stdout.channel.recv_exit_status()
-            
-            output = stdout.read().decode('utf-8', errors='ignore')
-            error = stderr.read().decode('utf-8', errors='ignore')
-            
-            if exit_status != 0:
-                logger.warning(f"Command returned non-zero exit status {exit_status}")
-                if error:
-                    logger.warning(f"Error output: {error}")
-            
-            return output
-            
-        except Exception as e:
-            logger.error(f"Failed to execute command '{command}': {e}")
-            return None
-    
     def parse_rpki_output(self, output: str) -> Tuple[List[Dict], str]:
         """Parse RPKI session output with improved error handling"""
         sessions = []
@@ -232,16 +340,27 @@ class RPKIChecker:
         
         lines = output.splitlines()
         
+        # Debug: log first few lines to understand format
+        logger.debug(f"First 5 lines of output: {lines[:5] if len(lines) >= 5 else lines}")
+        
         # Find session data lines (containing IP addresses)
         for line in lines:
+            # Skip empty lines and headers
+            if not line.strip() or 'Session' in line and 'State' in line:
+                continue
+                
             # Match lines with IP addresses
             if re.search(r'\d+\.\d+\.\d+\.\d+', line):
-                # Remove "Session:" prefix if present (NetEngine format)
+                # Remove "Session:" prefix if present
                 line = re.sub(r'^Session:\s*', '', line.strip())
                 
                 # Try multiple parsing patterns
                 # Pattern 1: Standard format with multiple spaces
                 parts = re.split(r'\s{2,}', line.strip())
+                
+                # Also try single space split if double space fails
+                if len(parts) < 4:
+                    parts = line.split()
                 
                 if len(parts) >= 4:
                     try:
@@ -252,11 +371,25 @@ class RPKIChecker:
                             'records': parts[3] if len(parts) > 3 else '0/0'
                         }
                         
+                        # Normalize state names
+                        state_lower = session['state'].lower()
+                        if 'estab' in state_lower:
+                            session['state'] = 'Established'
+                        elif 'idle' in state_lower:
+                            session['state'] = 'Idle'
+                        elif 'negot' in state_lower:
+                            session['state'] = 'Negotiation'
+                        elif 'syn' in state_lower or 'sync' in state_lower:
+                            session['state'] = 'Syn'
+                        
                         # Parse IPv4/IPv6 records
                         if '/' in session['records']:
                             ipv4, ipv6 = session['records'].split('/')
-                            session['ipv4_count'] = int(ipv4)
-                            session['ipv6_count'] = int(ipv6)
+                            # Remove any non-numeric characters
+                            ipv4 = re.sub(r'[^\d]', '', ipv4)
+                            ipv6 = re.sub(r'[^\d]', '', ipv6)
+                            session['ipv4_count'] = int(ipv4) if ipv4 else 0
+                            session['ipv6_count'] = int(ipv6) if ipv6 else 0
                         else:
                             session['ipv4_count'] = 0
                             session['ipv6_count'] = 0
@@ -340,27 +473,23 @@ class RPKIChecker:
         """
         
         for session in sessions:
-            state_class = session['state'].lower()
-            state_emoji = ''
+            state = session['state'].lower()
+            state_class = state
             
-            if state_class == 'established' and session['ipv4_count'] > 0:
+            if state == 'established' and session['ipv4_count'] > 0:
                 state_class = 'established'
-                state_emoji = '🟢'
-            elif state_class == 'idle':
-                state_emoji = '⚠️'
-            elif state_class == 'negotiation':
+            elif state == 'idle':
+                state_class = 'idle'
+            elif state == 'negotiation':
                 state_class = 'negotiation'
-                state_emoji = '🔄'
-            elif state_class == 'syn':
+            elif state in ['syn', 'sync']:
                 state_class = 'syn'
-                state_emoji = '🟠'
             else:
                 state_class = 'error'
-                state_emoji = '🔴'
             
             html += f"""
                 <tr class="{state_class}">
-                    <td>{state_emoji} {session['ip']}</td>
+                    <td>{session['ip']}</td>
                     <td>{session['state']}</td>
                     <td>{session['age']}</td>
                     <td>{session['records']}</td>
@@ -415,33 +544,43 @@ class RPKIChecker:
             'issues': []
         }
         
-        NEGOTIATION_TIMEOUT_MINUTES = 30  # Reset if in negotiation for more than 30 minutes
+        NEGOTIATION_TIMEOUT_MINUTES = 5  # Reset if in negotiation for more than 5 minutes
+        ESTABLISHED_STUCK_MINUTES = 60  # Consider stuck if established but no records for 60 minutes
         
         for session in sessions:
             state = session['state'].lower()
+            age_minutes = self.parse_age_to_minutes(session.get('age', '0'))
             
-            if state == 'established' and session['ipv4_count'] > 0:
-                analysis['established'].append(session['ip'])
+            if state == 'established':
+                if session['ipv4_count'] > 0 or session['ipv6_count'] > 0:
+                    analysis['established'].append(session['ip'])
+                else:
+                    # Established but no records - check if stuck
+                    if age_minutes > ESTABLISHED_STUCK_MINUTES:
+                        analysis['need_reset'].append(session['ip'])
+                        logger.warning(f"Session {session['ip']} established but no records for {session.get('age')} - will reset")
+                    else:
+                        logger.info(f"Session {session['ip']} established but waiting for records ({session.get('age')})")
+                        
             elif state == 'idle':
                 analysis['idle'].append(session['ip'])
-                if session['ipv4_count'] == 0 and session['ipv6_count'] == 0:
-                    analysis['need_reset'].append(session['ip'])
+                analysis['need_reset'].append(session['ip'])
+                
             elif state == 'negotiation':
                 analysis['negotiation'].append(session['ip'])
-                
-                # Check how long it's been in negotiation
-                age_minutes = self.parse_age_to_minutes(session.get('age', '0'))
-                
-                # Reset if: no records OR stuck in negotiation for too long
-                if (session['ipv4_count'] == 0 and session['ipv6_count'] == 0) or \
-                   (age_minutes > NEGOTIATION_TIMEOUT_MINUTES):
+                # Reset if stuck in negotiation
+                if age_minutes > NEGOTIATION_TIMEOUT_MINUTES:
                     analysis['need_reset'].append(session['ip'])
                     logger.warning(f"Session {session['ip']} stuck in Negotiation for {session.get('age')} ({age_minutes} minutes) - will reset")
-            elif state == 'syn':
+                    
+            elif state in ['syn', 'sync']:
                 analysis['syn'].append(session['ip'])
+                # Usually syn state resolves quickly, reset if stuck
+                if age_minutes > 2:
+                    analysis['need_reset'].append(session['ip'])
         
         # Determine health status
-        if analysis['idle'] or analysis['negotiation'] or analysis['syn']:
+        if analysis['idle'] or analysis['negotiation'] or analysis['syn'] or analysis['need_reset']:
             analysis['healthy'] = False
             
             if analysis['idle']:
@@ -454,22 +593,56 @@ class RPKIChecker:
         return analysis
     
     def reset_sessions(self, sessions_to_reset: List[str]) -> bool:
-        """Reset specified RPKI sessions"""
+        """Reset specified RPKI sessions using interactive SSH"""
         if self.test_mode:
             logger.info(f"TEST MODE: Would reset sessions: {sessions_to_reset}")
             return True
         
+        if not self.ssh:
+            logger.error("No SSH connection available")
+            return False
+        
         success = True
-        for session_ip in sessions_to_reset:
-            command = f"reset rpki session {session_ip}"
-            logger.info(f"Resetting session: {session_ip}")
+        
+        for i, session_ip in enumerate(sessions_to_reset):
+            logger.info(f"Resetting RPKI session {i+1}/{len(sessions_to_reset)}: {session_ip}")
             
-            result = self.execute_command(command)
-            if result is None:
-                logger.error(f"Failed to reset session {session_ip}")
-                success = False
+            # Execute reset command
+            command = f"reset rpki session {session_ip}"
+            result = self.ssh.execute_command(command, timeout=15)
+            
+            if result is not None:
+                # Check for error messages
+                if any(error in result.lower() for error in ["error", "unrecognized", "invalid", "wrong", "failed"]):
+                    logger.error(f"Reset command failed for {session_ip}: {result[:200]}")
+                    success = False
+                else:
+                    # For Huawei, might need to confirm
+                    if "confirm" in result.lower() or "[y/n]" in result.lower():
+                        # Send confirmation
+                        confirm_result = self.ssh.execute_command("y", timeout=5)
+                        logger.info(f"Confirmed reset for session {session_ip}")
+                    else:
+                        logger.info(f"Session {session_ip} reset command executed")
             else:
-                logger.info(f"Session {session_ip} reset command sent")
+                logger.warning(f"No response for reset of {session_ip}")
+            
+            # Wait a bit between resets
+            if i < len(sessions_to_reset) - 1:
+                time.sleep(2)
+        
+        # Wait and then verify the reset worked
+        if sessions_to_reset:
+            logger.info("Waiting 10 seconds for sessions to re-establish...")
+            time.sleep(10)
+            
+            # Check status again
+            output = self.ssh.execute_command("display rpki session")
+            if output:
+                sessions, _ = self.parse_rpki_output(output)
+                for session in sessions:
+                    if session['ip'] in sessions_to_reset:
+                        logger.info(f"Session {session['ip']} is now in state: {session['state']}")
         
         return success
     
@@ -498,7 +671,7 @@ class RPKIChecker:
             smtp_port = int(self.config.get('smtp_port', 587))
             
             with smtplib.SMTP(self.config['smtp_server'], smtp_port, timeout=30) as server:
-                server.set_debuglevel(0)  # Set to 1 for SMTP debug output
+                server.set_debuglevel(0)
                 
                 # Start TLS if not using port 25
                 if smtp_port != 25:
@@ -514,10 +687,6 @@ class RPKIChecker:
             logger.info(f"Alert email sent successfully to {self.config['email_receiver']}")
             return True
             
-        except smtplib.SMTPAuthenticationError as e:
-            logger.error(f"SMTP authentication failed: {e}")
-        except smtplib.SMTPException as e:
-            logger.error(f"SMTP error occurred: {e}")
         except Exception as e:
             logger.error(f"Failed to send email: {e}")
         
@@ -532,13 +701,23 @@ class RPKIChecker:
         if self.test_mode:
             return True
         
-        # Check if we've already alerted recently (within 1 hour)
+        # Check alert frequency based on severity
         if self.state.get('last_alert'):
             try:
                 last_alert = datetime.fromisoformat(self.state['last_alert'])
-                if (datetime.now() - last_alert).total_seconds() < 3600:
-                    logger.info("Alert suppressed (sent within last hour)")
-                    return False
+                time_since_alert = (datetime.now() - last_alert).total_seconds()
+                
+                # CRITICAL: Both sessions down - alert every 30 minutes
+                if len(analysis['established']) == 0:
+                    if time_since_alert < 1800:  # 30 minutes
+                        logger.info(f"Critical alert suppressed (sent {int(time_since_alert/60)} minutes ago, waiting for 30)")
+                        return False
+                    logger.warning("CRITICAL: All RPKI sessions are down - sending alert")
+                # WARNING: At least one session has issues - alert every hour
+                else:
+                    if time_since_alert < 3600:  # 60 minutes
+                        logger.info(f"Warning alert suppressed (sent {int(time_since_alert/60)} minutes ago, waiting for 60)")
+                        return False
             except:
                 pass
         
@@ -582,8 +761,388 @@ class RPKIChecker:
         
         return True
     
+    def _generate_alert_email(self, analysis: Dict, html_table: str, severity: str) -> str:
+        """Generate alert email HTML with professional GOLINE branding"""
+        is_critical = "CRITICAL" in severity
+        border_color = "#dc3545" if is_critical else "#ffc107"
+        severity_color = "#dc3545" if is_critical else "#856404"
+        severity_bg = "#f8d7da" if is_critical else "#fff3cd"
+        
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    line-height: 1.3;
+                    color: #333;
+                    background-color: #f5f7fa;
+                    margin: 0;
+                    padding: 0;
+                }}
+                .container {{
+                    max-width: 800px;
+                    margin: 0 auto;
+                    background: white;
+                    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                }}
+                .header-block {{
+                    background: #1e3c72;
+                    color: white;
+                    padding: 15px 20px;
+                    border-bottom: 3px solid {border_color};
+                }}
+                .header-block h1 {{
+                    margin: 0;
+                    font-size: 20px;
+                    font-weight: 400;
+                }}
+                .header-block .subtitle {{
+                    font-size: 12px;
+                    color: #b8d4f1;
+                    margin: 0;
+                }}
+                .alert-text {{
+                    color: {"#ff6b6b" if is_critical else "#ffeb3b"};
+                    font-weight: bold;
+                    font-size: 13px;
+                }}
+                .content {{
+                    padding: 15px 20px;
+                }}
+                .info-grid {{
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 10px;
+                    margin: 10px 0;
+                    padding: 10px;
+                    background: #f8f9fb;
+                    border-radius: 4px;
+                    font-size: 13px;
+                }}
+                .info-item {{
+                    display: flex;
+                    align-items: center;
+                }}
+                .info-label {{
+                    font-weight: 600;
+                    color: #1e3c72;
+                    margin-right: 6px;
+                }}
+                .section-title {{
+                    color: #1e3c72;
+                    border-bottom: 1px solid #e1e8f0;
+                    padding-bottom: 2px;
+                    margin: 10px 0 0 0;
+                    font-size: 14px;
+                }}
+                .footer {{
+                    background: #1e3c72;
+                    color: #b8d4f1;
+                    padding: 10px;
+                    text-align: center;
+                    font-size: 11px;
+                }}
+                .footer a {{
+                    color: #fff;
+                    text-decoration: none;
+                }}
+                .alert-box {{
+                    background: {severity_bg};
+                    border-left: 3px solid {border_color};
+                    padding: 8px 10px;
+                    margin: 10px 0;
+                    border-radius: 3px;
+                    font-size: 13px;
+                    color: {severity_color};
+                    font-weight: bold;
+                }}
+                .status-summary {{
+                    background: #f0f4f8;
+                    padding: 8px;
+                    border-radius: 4px;
+                    margin: 10px 0;
+                    font-size: 13px;
+                    text-align: center;
+                }}
+                ul {{
+                    margin: 5px 0;
+                    padding-left: 20px;
+                }}
+                li {{
+                    margin: 3px 0;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header-block">
+                    <div style="line-height: 1.2;">
+                        <h1 style="margin: 0;">HUAWEI RPKI MONITOR v3.0</h1>
+                        <div class="subtitle">Session Monitoring System</div>
+                        <div class="alert-text">{severity}</div>
+                    </div>
+                </div>
+                
+                <div class="content">
+                    <div class="info-grid">
+                        <div class="info-item">
+                            <span class="info-label">🕐 Time:</span>
+                            <span>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} CET</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">🖥 Device:</span>
+                            <span>{self.config['hostname']}</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">{"🔴" if is_critical else "⚠️"} Status:</span>
+                            <span style="color: {severity_color}; font-weight: bold;">
+                                {"CRITICAL - ALL DOWN" if is_critical else "WARNING - ISSUES DETECTED"}
+                            </span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">📊 Sessions:</span>
+                            <span>{analysis['total']} total, {len(analysis['established'])} working</span>
+                        </div>
+                    </div>
+                    
+                    <div class="alert-box">
+                        {"⚠️ CRITICAL ALERT: All RPKI sessions are down! No BGP prefix validation is currently active. This is a severe security risk." if is_critical else "⚠️ WARNING: Some RPKI sessions are experiencing issues. BGP validation may be degraded."}
+                    </div>
+                    
+                    <div class="status-summary">
+                        <strong style="color: #1e3c72;">Current Status:</strong>
+                        &nbsp;&nbsp;Total: <strong>{analysis['total']}</strong>
+                        &nbsp;&nbsp;|&nbsp;&nbsp;
+                        <span style="color: {"#dc3545" if len(analysis['established']) == 0 else "#28a745"};">
+                            ✓ Established: <strong>{len(analysis['established'])}</strong>
+                        </span>
+                        &nbsp;&nbsp;|&nbsp;&nbsp;
+                        <span style="color: #856404;">Idle: <strong>{len(analysis['idle'])}</strong></span>
+                        &nbsp;&nbsp;|&nbsp;&nbsp;
+                        <span style="color: #856404;">Negotiating: <strong>{len(analysis['negotiation'])}</strong></span>
+                        &nbsp;&nbsp;|&nbsp;&nbsp;
+                        <span style="color: #dc3545;">Syn: <strong>{len(analysis['syn'])}</strong></span>
+                    </div>
+                    
+                    <h2 class="section-title">📊 Session Details</h2>
+                    {html_table}
+                    
+                    {'<div class="alert-box" style="background: #f8d7da; margin-top: 15px;"><strong>🚨 CRITICAL SEVERITY:</strong> Immediate action required! No RPKI validation is active. All BGP prefixes are currently unvalidated.</div>' if is_critical else ''}
+                    
+                    <div style="background: #fff3cd; border-left: 3px solid #ffc107; padding: 8px 10px; margin: 10px 0; border-radius: 3px; font-size: 13px;">
+                        <strong>💡 Recommended Actions:</strong>
+                        <ul style="margin: 5px 0; padding-left: 20px;">
+                            <li>Check RPKI server connectivity (185.54.81.25 and 185.54.81.23)</li>
+                            <li>Verify network path to RPKI validators</li>
+                            <li>Review BGP peering status</li>
+                            <li>Check if RPKI servers are operational</li>
+                            {"<li style='color: #dc3545; font-weight: bold;'>⚠️ BGP validation is currently NOT active!</li>" if is_critical else ""}
+                        </ul>
+                    </div>
+                    
+                    <div style="margin-top: 15px; padding: 8px; background: #f8f9fb; border-radius: 4px; font-size: 12px;">
+                        <strong>Alert Frequency:</strong> {"This CRITICAL alert will repeat every 30 minutes until resolved." if is_critical else "This WARNING alert will repeat every 60 minutes until resolved."}
+                    </div>
+                </div>
+                
+                <div class="footer">
+                    <strong>GOLINE SA</strong> | Via Croce Campagna 2, 6855 Stabio, Switzerland | 📧 <a href="mailto:noc@goline.ch">noc@goline.ch</a><br>
+                    <span style="opacity: 0.8;">Automated {"critical" if is_critical else "warning"} alert from HuaweiRPKICheck v3.0</span>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+    
+    def _generate_recovery_email(self, analysis: Dict, html_table: str) -> str:
+        """Generate recovery email HTML with professional GOLINE branding"""
+        # Calculate recovered sessions
+        prev = self.state.get('previous_analysis', {})
+        prev_issues = set(prev.get('idle', [])) | set(prev.get('negotiation', [])) | set(prev.get('syn', []))
+        curr_established = set(analysis.get('established', []))
+        recovered_sessions = prev_issues & curr_established
+        
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    line-height: 1.3;
+                    color: #333;
+                    background-color: #f5f7fa;
+                    margin: 0;
+                    padding: 0;
+                }}
+                .container {{
+                    max-width: 800px;
+                    margin: 0 auto;
+                    background: white;
+                    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                }}
+                .header-block {{
+                    background: #1e3c72;
+                    color: white;
+                    padding: 15px 20px;
+                    border-bottom: 3px solid #28a745;
+                }}
+                .header-block h1 {{
+                    margin: 0;
+                    font-size: 20px;
+                    font-weight: 400;
+                }}
+                .header-block .subtitle {{
+                    font-size: 12px;
+                    color: #b8d4f1;
+                    margin: 0;
+                }}
+                .recovery-text {{
+                    color: #90ee90;
+                    font-weight: bold;
+                    font-size: 13px;
+                }}
+                .content {{
+                    padding: 15px 20px;
+                }}
+                .info-grid {{
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 10px;
+                    margin: 10px 0;
+                    padding: 10px;
+                    background: #f8f9fb;
+                    border-radius: 4px;
+                    font-size: 13px;
+                }}
+                .info-item {{
+                    display: flex;
+                    align-items: center;
+                }}
+                .info-label {{
+                    font-weight: 600;
+                    color: #1e3c72;
+                    margin-right: 6px;
+                }}
+                .section-title {{
+                    color: #1e3c72;
+                    border-bottom: 1px solid #e1e8f0;
+                    padding-bottom: 2px;
+                    margin: 10px 0 0 0;
+                    font-size: 14px;
+                }}
+                .footer {{
+                    background: #1e3c72;
+                    color: #b8d4f1;
+                    padding: 10px;
+                    text-align: center;
+                    font-size: 11px;
+                }}
+                .footer a {{
+                    color: #fff;
+                    text-decoration: none;
+                }}
+                .success-box {{
+                    background: #d4edda;
+                    border-left: 3px solid #28a745;
+                    padding: 8px 10px;
+                    margin: 10px 0;
+                    border-radius: 3px;
+                    font-size: 13px;
+                }}
+                .status-summary {{
+                    background: #f0f4f8;
+                    padding: 8px;
+                    border-radius: 4px;
+                    margin: 10px 0;
+                    font-size: 13px;
+                    text-align: center;
+                }}
+                ul {{
+                    margin: 5px 0;
+                    padding-left: 20px;
+                }}
+                li {{
+                    margin: 3px 0;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header-block">
+                    <div style="line-height: 1.2;">
+                        <h1 style="margin: 0;">HUAWEI RPKI MONITOR v3.0</h1>
+                        <div class="subtitle">Session Monitoring System</div>
+                        <div class="recovery-text">✅ SESSIONS RECOVERED</div>
+                    </div>
+                </div>
+                
+                <div class="content">
+                    <div class="info-grid">
+                        <div class="info-item">
+                            <span class="info-label">🕐 Time:</span>
+                            <span>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} CET</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">🖥 Device:</span>
+                            <span>{self.config['hostname']}</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">✅ Status:</span>
+                            <span style="color: #28a745; font-weight: bold;">ALL SESSIONS HEALTHY</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">🔄 Recovered:</span>
+                            <span style="color: #28a745; font-weight: bold;">{len(recovered_sessions)} sessions</span>
+                        </div>
+                    </div>
+                    
+                    <div class="status-summary">
+                        <strong style="color: #28a745;">Current Status:</strong>
+                        &nbsp;&nbsp;Total: <strong>{analysis['total']}</strong>
+                        &nbsp;&nbsp;|&nbsp;&nbsp;
+                        <span style="color: #28a745;">✓ Established: <strong>{len(analysis['established'])}</strong></span>
+                        &nbsp;&nbsp;|&nbsp;&nbsp;
+                        <span style="color: #6c757d;">Idle: <strong>{len(analysis['idle'])}</strong></span>
+                        &nbsp;&nbsp;|&nbsp;&nbsp;
+                        <span style="color: #6c757d;">Negotiating: <strong>{len(analysis['negotiation'])}</strong></span>
+                    </div>
+                    
+                    <h2 class="section-title">📊 Session Details</h2>
+                    {html_table}
+                    
+                    <div class="success-box">
+                        <strong>✅ Recovery Details:</strong>
+                        <ul>
+                            {''.join([f'<li>Session {ip} is now established and operational</li>' for ip in recovered_sessions]) if recovered_sessions else '<li>All sessions are now operational</li>'}
+                        </ul>
+                    </div>
+                    
+                    <div class="success-box">
+                        <strong>📝 Summary:</strong>
+                        <ul>
+                            <li>RPKI sessions have been successfully restored</li>
+                            <li>All BGP prefixes are now being validated</li>
+                            <li>No further action required</li>
+                        </ul>
+                    </div>
+                </div>
+                
+                <div class="footer">
+                    <strong>GOLINE SA</strong> | Via Croce Campagna 2, 6855 Stabio, Switzerland | 📧 <a href="mailto:noc@goline.ch">noc@goline.ch</a><br>
+                    <span style="opacity: 0.8;">Automated recovery notification from HuaweiRPKICheck v3.0</span>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+    
     def run_check(self) -> bool:
-        """Main check routine"""
+        """Main check routine using interactive SSH"""
         logger.info("="*50)
         logger.info(f"Starting RPKI check at {datetime.now()}")
         
@@ -594,14 +1153,22 @@ class RPKIChecker:
                 self.save_state()
                 return False
             
-            # Connect via SSH
-            if not self.ssh_connect():
+            # Create interactive SSH session
+            self.ssh = InteractiveSSH(
+                self.config['hostname'],
+                self.config['username'],
+                self.config['password']
+            )
+            
+            # Connect
+            if not self.ssh.connect():
+                logger.error("Failed to establish interactive SSH session")
                 self.state['consecutive_failures'] += 1
                 self.save_state()
                 return False
             
             # Execute RPKI command
-            output = self.execute_command("display rpki session")
+            output = self.ssh.execute_command("display rpki session")
             if not output:
                 logger.error("No output received from RPKI command")
                 self.state['consecutive_failures'] += 1
@@ -610,6 +1177,10 @@ class RPKIChecker:
             
             # Parse output
             sessions, html_table = self.parse_rpki_output(output)
+            
+            if not sessions:
+                logger.warning("No sessions found in output")
+                logger.debug(f"Raw output: {output[:500]}")
             
             # Analyze sessions
             analysis = self.analyze_sessions(sessions)
@@ -626,370 +1197,29 @@ class RPKIChecker:
             
             # Check for recovery and send recovery notification
             if self.check_for_recovery(analysis) and self.should_send_recovery_alert():
-                # Get recovered sessions
-                prev = self.state.get('previous_analysis', {})
-                prev_issues = set(prev.get('idle', [])) | set(prev.get('negotiation', [])) | set(prev.get('syn', []))
-                curr_established = set(analysis.get('established', []))
-                recovered_sessions = prev_issues & curr_established
-                
                 subject = f"[RPKI Monitor] ✅ Recovery: Sessions Restored"
-                
-                # Create recovery email
-                body = f"""
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <meta charset="UTF-8">
-                    <style>
-                        body {{
-                            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                            line-height: 1.3;
-                            color: #333;
-                            background-color: #f5f7fa;
-                            margin: 0;
-                            padding: 0;
-                        }}
-                        .container {{
-                            max-width: 800px;
-                            margin: 0 auto;
-                            background: white;
-                            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-                        }}
-                        .header-block {{
-                            background: #1e3c72;
-                            color: white;
-                            padding: 15px 20px;
-                            border-bottom: 3px solid #28a745;
-                        }}
-                        .header-block h1 {{
-                            margin: 0;
-                            font-size: 20px;
-                            font-weight: 400;
-                        }}
-                        .header-block .subtitle {{
-                            font-size: 12px;
-                            color: #b8d4f1;
-                            margin: 0;
-                        }}
-                        .recovery-text {{
-                            color: #90ee90;
-                            font-weight: bold;
-                            font-size: 13px;
-                        }}
-                        .content {{
-                            padding: 15px 20px;
-                        }}
-                        .info-grid {{
-                            display: grid;
-                            grid-template-columns: 1fr 1fr;
-                            gap: 10px;
-                            margin: 10px 0;
-                            padding: 10px;
-                            background: #f8f9fb;
-                            border-radius: 4px;
-                            font-size: 13px;
-                        }}
-                        .info-item {{
-                            display: flex;
-                            align-items: center;
-                        }}
-                        .info-label {{
-                            font-weight: 600;
-                            color: #1e3c72;
-                            margin-right: 6px;
-                        }}
-                        .section-title {{
-                            color: #1e3c72;
-                            border-bottom: 1px solid #e1e8f0;
-                            padding-bottom: 2px;
-                            margin: 10px 0 0 0;
-                            font-size: 14px;
-                        }}
-                        .footer {{
-                            background: #1e3c72;
-                            color: #b8d4f1;
-                            padding: 10px;
-                            text-align: center;
-                            font-size: 11px;
-                        }}
-                        .footer a {{
-                            color: #fff;
-                            text-decoration: none;
-                        }}
-                        .success-box {{
-                            background: #d4edda;
-                            border-left: 3px solid #28a745;
-                            padding: 8px 10px;
-                            margin: 10px 0;
-                            border-radius: 3px;
-                            font-size: 13px;
-                        }}
-                        ul {{
-                            margin: 5px 0;
-                            padding-left: 20px;
-                        }}
-                        li {{
-                            margin: 3px 0;
-                        }}
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <div class="header-block">
-                            <div style="line-height: 1.2;">
-                                <h1 style="margin: 0;">HUAWEI RPKI MONITOR v2.0</h1>
-                                <div class="subtitle">Session Monitoring System</div>
-                                <div class="recovery-text">✅ SESSIONS RECOVERED</div>
-                            </div>
-                        </div>
-                        
-                        <div class="content">
-                            <div class="info-grid">
-                                <div class="info-item">
-                                    <span class="info-label">🕐 Time:</span>
-                                    <span>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} CET</span>
-                                </div>
-                                <div class="info-item">
-                                    <span class="info-label">🖥 Device:</span>
-                                    <span>{self.config['hostname']}</span>
-                                </div>
-                                <div class="info-item">
-                                    <span class="info-label">✅ Status:</span>
-                                    <span style="color: #28a745; font-weight: bold;">ALL SESSIONS HEALTHY</span>
-                                </div>
-                                <div class="info-item">
-                                    <span class="info-label">🔄 Recovered:</span>
-                                    <span style="color: #28a745; font-weight: bold;">{len(recovered_sessions)} sessions</span>
-                                </div>
-                            </div>
-                            
-                            <div style="background: #f0f4f8; padding: 8px; border-radius: 4px; margin: 10px 0; font-size: 13px; text-align: center;">
-                                <strong style="color: #28a745;">Current Status:</strong>
-                                &nbsp;&nbsp;Total: <strong>{analysis['total']}</strong>
-                                &nbsp;&nbsp;|&nbsp;&nbsp;
-                                <span style="color: #28a745;">✓ Established: <strong>{len(analysis['established'])}</strong></span>
-                                &nbsp;&nbsp;|&nbsp;&nbsp;
-                                <span style="color: #6c757d;">Idle: <strong>{len(analysis['idle'])}</strong></span>
-                                &nbsp;&nbsp;|&nbsp;&nbsp;
-                                <span style="color: #6c757d;">Negotiating: <strong>{len(analysis['negotiation'])}</strong></span>
-                            </div>
-                            
-                            <h2 class="section-title">📊 Session Details</h2>
-                            {html_table}
-                            
-                            <div class="success-box">
-                                <strong>✅ Recovery Details:</strong>
-                                <ul>
-                                    {''.join([f'<li>Session {ip} is now established and operational</li>' for ip in recovered_sessions])}
-                                </ul>
-                            </div>
-                            
-                            <div class="success-box">
-                                <strong>📝 Summary:</strong>
-                                <ul>
-                                    <li>RPKI sessions have been successfully restored</li>
-                                    <li>All BGP prefixes are now being validated</li>
-                                    <li>No further action required</li>
-                                </ul>
-                            </div>
-                        </div>
-                        
-                        <div class="footer">
-                            <strong>GOLINE SA</strong> | Via Croce Campagna 2, 6855 Stabio, Switzerland | 📧 <a href="mailto:noc@goline.ch">noc@goline.ch</a><br>
-                            <span style="opacity: 0.8;">Automated recovery notification from HuaweiRPKICheck_v2.py</span>
-                        </div>
-                    </div>
-                </body>
-                </html>
-                """
-                
+                body = self._generate_recovery_email(analysis, html_table)
                 if self.send_alert_email(subject, body):
                     self.state['last_recovery_alert'] = datetime.now().isoformat()
-                    logger.info(f"Recovery notification sent for {len(recovered_sessions)} sessions")
+                    logger.info(f"Recovery notification sent")
             
             # Send alert if needed
             elif not analysis['healthy'] and self.should_send_alert(analysis):
-                subject = f"[RPKI Monitor] Alert: {', '.join(analysis['issues'])}"
+                # Determine severity
+                if len(analysis['established']) == 0:
+                    severity = "🔴 CRITICAL"
+                    severity_text = "ALL SESSIONS DOWN"
+                else:
+                    severity = "⚠️ WARNING"
+                    severity_text = ', '.join(analysis['issues'])
                 
-                # Create professional HTML email with GOLINE branding
-                body = f"""
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <meta charset="UTF-8">
-                    <style>
-                        body {{
-                            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                            line-height: 1.3;
-                            color: #333;
-                            background-color: #f5f7fa;
-                            margin: 0;
-                            padding: 0;
-                        }}
-                        .container {{
-                            max-width: 800px;
-                            margin: 0 auto;
-                            background: white;
-                            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-                        }}
-                        .header-block {{
-                            background: #1e3c72;
-                            color: white;
-                            padding: 15px 20px;
-                            border-bottom: 3px solid #dc3545;
-                        }}
-                        .header-block h1 {{
-                            margin: 0;
-                            font-size: 20px;
-                            font-weight: 400;
-                        }}
-                        .header-block .subtitle {{
-                            font-size: 12px;
-                            color: #b8d4f1;
-                            margin: 0;
-                        }}
-                        .alert-text {{
-                            color: #ffeb3b;
-                            font-weight: bold;
-                            font-size: 13px;
-                        }}
-                        .content {{
-                            padding: 15px 20px;
-                        }}
-                        .info-grid {{
-                            display: grid;
-                            grid-template-columns: 1fr 1fr;
-                            gap: 10px;
-                            margin: 10px 0;
-                            padding: 10px;
-                            background: #f8f9fb;
-                            border-radius: 4px;
-                            font-size: 13px;
-                        }}
-                        .info-item {{
-                            display: flex;
-                            align-items: center;
-                        }}
-                        .info-label {{
-                            font-weight: 600;
-                            color: #1e3c72;
-                            margin-right: 6px;
-                        }}
-                        .section-title {{
-                            color: #1e3c72;
-                            border-bottom: 1px solid #e1e8f0;
-                            padding-bottom: 2px;
-                            margin: 10px 0 0 0;
-                            font-size: 14px;
-                        }}
-                        .footer {{
-                            background: #1e3c72;
-                            color: #b8d4f1;
-                            padding: 10px;
-                            text-align: center;
-                            font-size: 11px;
-                        }}
-                        .footer a {{
-                            color: #fff;
-                            text-decoration: none;
-                        }}
-                        .warning-box {{
-                            background: #fff3cd;
-                            border-left: 3px solid #ffc107;
-                            padding: 8px 10px;
-                            margin: 10px 0;
-                            border-radius: 3px;
-                            font-size: 13px;
-                        }}
-                        .success-box {{
-                            background: #d4edda;
-                            border-left: 3px solid #28a745;
-                            padding: 8px 10px;
-                            margin: 10px 0;
-                            border-radius: 3px;
-                            font-size: 13px;
-                        }}
-                        ul {{
-                            margin: 5px 0;
-                            padding-left: 20px;
-                        }}
-                        li {{
-                            margin: 3px 0;
-                        }}
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <div class="header-block">
-                            <div style="line-height: 1.2;">
-                                <h1 style="margin: 0;">HUAWEI RPKI MONITOR v2.0</h1>
-                                <div class="subtitle">Session Monitoring System</div>
-                                <div class="alert-text">⚠ ANOMALY DETECTED</div>
-                            </div>
-                        </div>
-                        
-                        <div class="content">
-                            <div class="info-grid">
-                                <div class="info-item">
-                                    <span class="info-label">🕐 Time:</span>
-                                    <span>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} CET</span>
-                                </div>
-                                <div class="info-item">
-                                    <span class="info-label">🖥 Device:</span>
-                                    <span>{self.config['hostname']}</span>
-                                </div>
-                                <div class="info-item">
-                                    <span class="info-label">⚠ Issues:</span>
-                                    <span style="color: #dc3545; font-weight: bold;">{', '.join(analysis['issues'])}</span>
-                                </div>
-                                <div class="info-item">
-                                    <span class="info-label">🔴 Severity:</span>
-                                    <span style="color: #dc3545; font-weight: bold;">HIGH</span>
-                                </div>
-                            </div>
-                            
-                            <div style="background: #f0f4f8; padding: 8px; border-radius: 4px; margin: 10px 0; font-size: 13px; text-align: center;">
-                                <strong style="color: #1e3c72;">Sessions:</strong>
-                                &nbsp;&nbsp;Total: <strong>{analysis['total']}</strong>
-                                &nbsp;&nbsp;|&nbsp;&nbsp;
-                                <span style="color: #28a745;">✓ OK: <strong>{len(analysis['established'])}</strong></span>
-                                &nbsp;&nbsp;|&nbsp;&nbsp;
-                                <span style="color: #ffc107;">⚠ Idle: <strong>{len(analysis['idle'])}</strong></span>
-                                &nbsp;&nbsp;|&nbsp;&nbsp;
-                                <span style="color: #fd7e14;">🔄 Negotiating: <strong>{len(analysis['negotiation'])}</strong></span>
-                                &nbsp;&nbsp;|&nbsp;&nbsp;
-                                <span style="color: #dc3545;">🔶 SYN: <strong>{len(analysis['syn'])}</strong></span>
-                            </div>
-                            
-                            <h2 class="section-title">📊 Session Details</h2>
-                            {html_table}
-                            
-                            {'<div class="success-box"><strong>✓ Automatic Recovery:</strong> Sessions reset: ' + ', '.join(analysis['need_reset']) + '</div>' if analysis['need_reset'] else ''}
-                            
-                            <div class="warning-box">
-                                <strong>💡 Recommended Actions:</strong>
-                                <ul>
-                                    <li>Review RPKI server connectivity</li>
-                                    <li>Check BGP peering status</li>
-                                    <li>Verify network path to RPKI validators</li>
-                                    <li>Monitor for recurring issues</li>
-                                </ul>
-                            </div>
-                        </div>
-                        
-                        <div class="footer">
-                            <strong>GOLINE SA</strong> | Via Croce Campagna 2, 6855 Stabio, Switzerland | 📧 <a href="mailto:noc@goline.ch">noc@goline.ch</a><br>
-                            <span style="opacity: 0.8;">Automated alert from HuaweiRPKICheck_v2.py</span>
-                        </div>
-                    </div>
-                </body>
-                </html>
-                """
+                subject = f"[RPKI Monitor] {severity}: {severity_text}"
+                body = self._generate_alert_email(analysis, html_table, severity)
                 
                 if self.send_alert_email(subject, body):
                     self.state['last_alert'] = datetime.now().isoformat()
             
-            # Update state with current analysis for next comparison
+            # Update state
             self.state['consecutive_failures'] = 0
             self.state['previous_analysis'] = {
                 'healthy': analysis['healthy'],
@@ -1012,18 +1242,15 @@ class RPKIChecker:
             
         finally:
             # Clean up SSH connection
-            if self.ssh_client:
-                try:
-                    self.ssh_client.close()
-                except:
-                    pass
+            if self.ssh:
+                self.ssh.disconnect()
 
 # Import email.utils for email date formatting
 import email.utils
 
 def main():
     """Main entry point with argument parsing"""
-    parser = argparse.ArgumentParser(description='Huawei RPKI Session Checker v2.0')
+    parser = argparse.ArgumentParser(description='Huawei RPKI Session Checker v3.0')
     parser.add_argument('--test', action='store_true', help='Run in test mode (no changes, no emails)')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
     parser.add_argument('--config', type=str, default=str(CONFIG_FILE), help='Path to config file')
