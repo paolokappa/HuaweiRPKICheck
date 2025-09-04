@@ -1,524 +1,266 @@
-<div align="center">
-<br />
+# HuaweiRPKICheck v2.0
 
-<h1 align="center">
-  <br>
-  HuaweiRPKICheck v2.0
-  <br>
-</h1>
+This project provides an automated monitoring and recovery system for Huawei NetEngine RPKI sessions. The main purpose is to address a known issue with Huawei NetEngine routers where RPKI sessions fail to automatically reset when the RPKI server becomes available after an outage.
 
-<h4 align="center">Enterprise-Grade RPKI Session Management for Huawei NetEngine Routers</h4>
+## 🆕 What's New in v2.0
 
-<p align="center">
-  <a href="https://www.python.org/">
-    <img src="https://img.shields.io/badge/python-v3.6+-blue.svg" alt="Python">
-  </a>
-  <a href="https://github.com/paramiko/paramiko">
-    <img src="https://img.shields.io/badge/paramiko-2.7.2+-green.svg" alt="Paramiko">
-  </a>
-  <a href="https://cryptography.io/">
-    <img src="https://img.shields.io/badge/cryptography-3.4.8+-red.svg" alt="Cryptography">
-  </a>
-  <a href="LICENSE">
-    <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License">
-  </a>
-  <a href="https://github.com/paolokappa/HuaweiRPKICheck/releases">
-    <img src="https://img.shields.io/badge/version-2.0-brightgreen.svg" alt="Version">
-  </a>
-  <a href="https://github.com/paolokappa/HuaweiRPKICheck/graphs/commit-activity">
-    <img src="https://img.shields.io/badge/Maintained%3F-yes-green.svg" alt="Maintenance">
-  </a>
-</p>
+### Major Enhancements
+- **🔄 Automatic Recovery Detection**: Now sends notifications when sessions recover from problematic states
+- **⏰ Smart Timeout Management**: Automatically resets sessions stuck in Negotiation for more than 5 minutes
+- **📧 Improved Email Templates**: Professional HTML emails with consistent styling and better readability
+- **📊 Enhanced State Tracking**: Persistent state management to track session history and prevent duplicate alerts
+- **🎨 Visual Status Indicators**: Color-coded session states with emoji indicators for quick status identification
 
-<p align="center">
-  <b>Automated monitoring, recovery, and alerting system for critical RPKI infrastructure</b>
-  <br>
-  <br>
-  <a href="#-key-features">Features</a> •
-  <a href="#-installation">Installation</a> •
-  <a href="#-configuration">Configuration</a> •
-  <a href="#-documentation">Documentation</a> •
-  <a href="#-support">Support</a>
-</p>
+### Key Improvements
+- Recovery notifications with green success indicators
+- Configurable timeout thresholds for session resets
+- Better error handling and logging
+- Reduced false positives through intelligent state comparison
 
-<br>
-</div>
+## Purpose of the Project
 
----
+Huawei NetEngine routers have a bug where RPKI sessions do not automatically reset when the RPKI server becomes available after an outage. This can lead to routing issues that affect network security. This project automates the process of monitoring the status of RPKI sessions, automatically resetting problematic sessions, and notifying administrators of both issues and recoveries.
 
-## 📋 Executive Summary
+## How It Works
 
-**HuaweiRPKICheck** is a production-ready automation solution designed to address critical RPKI (Resource Public Key Infrastructure) session management issues in Huawei NetEngine routers. This enterprise-grade tool ensures continuous BGP route validation by automatically detecting and resolving RPKI session failures, significantly reducing manual intervention and improving network security posture.
+The monitoring system follows this workflow:
 
-### Business Value
+1. **Connection**: Establishes SSH connection to the Huawei router
+2. **Monitoring**: Executes `display rpki session` command every 15 minutes (via cron)
+3. **Analysis**: Evaluates session states:
+   - ✅ **Established**: Session is healthy with active prefixes
+   - ⚠️ **Idle**: Session is inactive (triggers reset if 0 prefixes)
+   - 🔄 **Negotiation**: Session is connecting (triggers reset if >5 minutes)
+   - 🔶 **Syn**: Session in synchronization phase
+4. **Action**: Automatically resets problematic sessions
+5. **Notification**: Sends appropriate email alerts:
+   - 🔴 **Problem Alert**: Blue header with red border, sent when issues detected
+   - ✅ **Recovery Alert**: Blue header with green border, sent when sessions recover
 
-- **🔒 Enhanced Security**: Maintains continuous RPKI validation for BGP routes
-- **⚡ Reduced MTTR**: Automatic detection and recovery within 15-30 minutes
-- **💰 Cost Savings**: Eliminates manual monitoring and intervention
-- **📊 Compliance**: Ensures adherence to routing security best practices
-- **🔄 24/7 Availability**: Autonomous operation with intelligent alerting
+## Project Structure
+
+This project consists of two main scripts:
+
+1. **Credential Encryption Script** (`HuaweiRPKI_credgen.py`):  
+   Used to securely generate and store encrypted credentials (such as SSH, SMTP, and email credentials) in a configuration file.
+   
+2. **RPKI Session Monitor and Reset Script** (`HuaweiRPKICheck.py`):  
+   Monitors the RPKI sessions on a Huawei NetEngine router, identifies problematic sessions, automatically resets them, and sends notifications for both problems and recoveries.
 
 ---
 
-## 🎯 Problem Statement
-
-Huawei NetEngine routers suffer from a critical firmware bug where RPKI sessions fail to automatically reestablish after server outages. This vulnerability can lead to:
-
-- Unvalidated BGP routes accepting potentially malicious prefixes
-- Extended periods of routing insecurity
-- Manual intervention requirements during off-hours
-- Compliance violations with routing security policies
-
-**Our Solution**: Automated monitoring with intelligent recovery mechanisms and real-time alerting.
-
----
-
-## ✨ Key Features
-
-### Core Functionality
-
-| Feature | Description | Business Impact |
-|---------|-------------|-----------------|
-| **Automated Monitoring** | SSH-based session polling every 15 minutes | Continuous visibility |
-| **Smart Recovery** | Automatic reset of stuck sessions (>30 min) | Reduced downtime |
-| **Dual Alerting** | Problem detection & recovery confirmation | Complete audit trail |
-| **State Management** | Persistent tracking prevents alert fatigue | Optimized operations |
-| **Secure Credentials** | AES encryption for sensitive data | Enterprise compliance |
-
-### Version 2.0 Enhancements
-
-```diff
-+ Automatic recovery detection with success notifications
-+ Configurable timeout thresholds for session management
-+ Professional HTML email templates with consistent branding
-+ Enhanced state persistence and comparison logic
-+ Improved error handling and debug logging
-```
-
----
-
-## 🏗️ Architecture
-
-```mermaid
-graph LR
-    A[Cron Scheduler] -->|15 min| B[HuaweiRPKICheck.py]
-    B --> C{SSH Connection}
-    C --> D[Huawei Router]
-    D --> E[RPKI Sessions]
-    B --> F[State Analysis]
-    F --> G{Issues Detected?}
-    G -->|Yes| H[Auto Reset]
-    G -->|Yes| I[Alert Email]
-    G -->|No| J[State Update]
-    H --> K[Recovery Check]
-    K -->|Success| L[Recovery Email]
-```
-
-### Technical Stack
-
-- **Language**: Python 3.6+ with type hints
-- **SSH Library**: Paramiko for secure router communication
-- **Encryption**: Cryptography (Fernet) for credential protection
-- **Email**: SMTP with HTML/MIME for rich notifications
-- **Logging**: Rotating file handlers with configurable verbosity
-
----
-
-## 📦 Installation
+## Installation and Setup
 
 ### Prerequisites
-
-```bash
-# System Requirements
 - Python 3.6 or higher
 - SSH access to Huawei NetEngine router
-- SMTP server for notifications
-- Linux/Unix environment (tested on Ubuntu/RHEL)
-```
+- SMTP server for email notifications
 
-### Quick Start
+### Step 1: Install Dependencies
 
-1. **Clone the Repository**
 ```bash
-git clone https://github.com/paolokappa/HuaweiRPKICheck.git
-cd HuaweiRPKICheck
+pip install paramiko cryptography
 ```
 
-2. **Install Dependencies**
-```bash
-pip install -r requirements.txt
-# or manually:
-pip install paramiko>=2.7.2 cryptography>=3.4.8
-```
+### Step 2: Configure Credentials
 
-3. **Configure Settings**
+1. Create a configuration file from the example:
 ```bash
 cp HuaweiRPKICheck.conf.example HuaweiRPKICheck.conf
-nano HuaweiRPKICheck.conf  # Edit with your settings
 ```
 
-4. **Encrypt Credentials**
+2. Edit the configuration with your settings:
+```ini
+hostname=192.168.1.1          # Your router IP
+username=admin                # SSH username
+password=your_password        # SSH password
+smtp_server=mail.example.com  # SMTP server
+smtp_port=587                 # SMTP port
+smtp_username=user@example.com # SMTP username
+smtp_password=smtp_pass       # SMTP password
+email_sender=rpki@example.com # From address
+email_receiver=noc@example.com # To address (can be comma-separated for multiple)
+```
+
+3. Encrypt the credentials:
 ```bash
 python3 HuaweiRPKI_credgen.py
-# Generates: secret.key (keep secure!) and encrypted config
 ```
 
-5. **Validate Installation**
+This generates:
+- `secret.key`: Encryption key (keep this secure!)
+- `HuaweiRPKICheck.conf`: Encrypted configuration
+
+### Step 3: Test the Script
+
+Run in test mode to verify configuration without making changes:
 ```bash
 python3 HuaweiRPKICheck.py --test
-# Runs in test mode without making changes
 ```
 
-6. **Deploy to Production**
+### Step 4: Schedule with Cron
+
+Add to crontab for automatic monitoring every 15 minutes:
 ```bash
-# Add to crontab for automated execution
 crontab -e
-# Add: */15 * * * * /usr/bin/python3 /path/to/HuaweiRPKICheck.py >/dev/null 2>&1
+```
+
+Add this line:
+```bash
+*/15 * * * * /usr/bin/python3 /opt/HuaweiRPKICheck/HuaweiRPKICheck.py >/dev/null 2>&1
 ```
 
 ---
 
-## 🔐 Credential Management
+## Email Notification Templates
 
-### HuaweiRPKI_credgen.py - Credential Encryption Tool
+### Problem Alert Email
+Sent when sessions have issues (Idle, Negotiation >30min, Syn):
 
-This utility securely encrypts your sensitive credentials before storage. Never store passwords in plain text!
+- **Header**: Blue background (#1e3c72) with red bottom border
+- **Status**: Shows issue count and severity
+- **Table**: Session details with color-coded states
+  - 🟢 Green: Established sessions
+  - ⚠️ Yellow: Idle/Negotiation sessions
+  - 🔴 Red: Error states
+- **Actions**: Automated reset notification and recommended manual checks
 
-#### Usage
+### Recovery Notification Email
+Sent when sessions recover to Established state:
 
-1. **Create your configuration file** with plain text credentials:
-```bash
-nano HuaweiRPKICheck.conf
-```
+- **Header**: Blue background (#1e3c72) with green bottom border
+- **Status**: "✅ SESSIONS RECOVERED" indicator
+- **Table**: Current healthy session status
+- **Summary**: Lists recovered sessions and confirms operational status
 
-2. **Add your configuration** (example):
-```ini
-hostname=192.168.1.1
-username=admin
-password=YourRouterPassword
-smtp_server=mail.company.com
-smtp_port=587
-smtp_username=rpki@company.com
-smtp_password=YourSMTPPassword
-email_sender=rpki@company.com
-email_receiver=noc@company.com
-```
-
-3. **Run the encryption tool**:
-```bash
-python3 HuaweiRPKI_credgen.py
-```
-
-4. **Output files generated**:
-   - `secret.key` - AES encryption key (⚠️ KEEP THIS SECURE!)
-   - `HuaweiRPKICheck.conf` - Encrypted configuration (safe to backup)
-
-#### Security Notes
-
-- The original plain text configuration is automatically overwritten with encrypted data
-- Store `secret.key` in a secure location with restricted permissions (chmod 600)
-- Never commit `secret.key` to version control
-- Backup both `secret.key` and encrypted config - you need both to run the script
-- If you lose `secret.key`, you'll need to recreate the configuration
-
-#### How It Works
-
-```python
-# The tool uses Fernet (symmetric encryption)
-from cryptography.fernet import Fernet
-
-# 1. Generates a unique encryption key
-key = Fernet.generate_key()
-
-# 2. Encrypts your configuration
-fernet = Fernet(key)
-encrypted_data = fernet.encrypt(config_data.encode())
-
-# 3. Saves encrypted config and key separately
-```
+Both emails include:
+- Professional GOLINE SA branding
+- Responsive HTML design
+- Clear visual indicators
+- Detailed session information table
+- Timestamp and device information
 
 ---
 
-## ⚙️ Configuration
-
-### Configuration Parameters
-
-| Parameter | Description | Example | Required |
-|-----------|-------------|---------|----------|
-| `hostname` | Router IP address | `192.168.1.1` | ✅ |
-| `username` | SSH username | `admin` | ✅ |
-| `password` | SSH password | `SecurePass123!` | ✅ |
-| `smtp_server` | Mail server | `smtp.company.com` | ✅ |
-| `smtp_port` | SMTP port | `587` | ✅ |
-| `smtp_username` | SMTP auth user | `rpki@company.com` | ⚠️ |
-| `smtp_password` | SMTP auth pass | `SmtpPass456!` | ⚠️ |
-| `email_sender` | From address | `rpki@company.com` | ✅ |
-| `email_receiver` | Alert recipient(s) | `noc@company.com` | ✅ |
-
-⚠️ *Required if SMTP authentication is enabled*
-
-### Security Best Practices
+## Command Line Options
 
 ```bash
-# Set restrictive permissions
-chmod 600 secret.key HuaweiRPKICheck.conf
-chmod 700 HuaweiRPKICheck.py
-
-# Store backups securely
-cp secret.key /secure/backup/location/
+python3 HuaweiRPKICheck.py [options]
 ```
-
----
-
-## 📊 Monitoring Logic
-
-### Session State Machine
-
-| State | Description | Action | Threshold |
-|-------|-------------|--------|-----------|
-| **Established** ✅ | Active with prefixes | Monitor | - |
-| **Idle** ⚠️ | Inactive session | Reset if 0 prefixes | Immediate |
-| **Negotiation** 🔄 | Connecting | Reset if stuck | >30 minutes |
-| **Syn** 🔶 | Synchronizing | Monitor | - |
-
-### Alert Management
-
-```python
-# Problem Detection (sent max 1/hour)
-if session.state in ['Idle', 'Negotiation', 'Syn']:
-    if time_since_last_alert > 3600:
-        send_problem_alert()
-
-# Recovery Notification (sent max 1/30min)
-if previous.state == 'Problem' and current.state == 'Established':
-    if time_since_last_recovery > 1800:
-        send_recovery_notification()
-```
-
----
-
-## 📧 Email Notifications
-
-The system sends two types of professional HTML emails:
-
-### Problem Alert
-- **Trigger**: When sessions are in problematic states (Idle, Negotiation >30min, Syn)
-- **Design**: Navy blue header (#1e3c72) with red bottom border
-- **Content**: 
-  - Detailed session status table with color-coded states
-  - Automatic reset confirmation for stuck sessions
-  - Recommended manual actions
-- **Frequency**: Maximum once per hour to prevent alert fatigue
-
-### Recovery Notification
-- **Trigger**: When previously problematic sessions return to Established state
-- **Design**: Navy blue header (#1e3c72) with green bottom border  
-- **Content**:
-  - List of recovered sessions
-  - Current healthy status confirmation
-  - No action required message
-- **Frequency**: Maximum once per 30 minutes
-
-Both emails include responsive HTML design, clear visual indicators, and GOLINE SA branding.
-
----
-
-## 📚 Documentation
-
-### Command Line Interface
-
-```bash
-python3 HuaweiRPKICheck.py [OPTIONS]
 
 Options:
-  --test              Run in test mode (no changes, no emails)
-  --verbose           Enable detailed debug logging
-  --config PATH       Custom configuration file path
-  --key PATH          Custom encryption key path
-  --help              Show this help message
-
-Examples:
-  # Test configuration
-  python3 HuaweiRPKICheck.py --test --verbose
-  
-  # Production with custom config
-  python3 HuaweiRPKICheck.py --config /etc/rpki/config.enc
-```
-
-### API Reference
-
-```python
-class RPKIChecker:
-    """Main RPKI session monitoring class"""
-    
-    def run_check(self) -> bool:
-        """Execute monitoring cycle"""
-        
-    def analyze_sessions(self, sessions: List[Dict]) -> Dict:
-        """Analyze session health status"""
-        
-    def reset_sessions(self, session_ips: List[str]) -> bool:
-        """Reset problematic sessions"""
-```
+- `--test`: Run in test mode (no changes, no emails)
+- `--verbose`: Enable verbose logging
+- `--config PATH`: Specify custom config file path
+- `--key PATH`: Specify custom key file path
 
 ---
 
-## 🔍 Troubleshooting
+## Troubleshooting
 
-### Common Issues
+### Sessions Not Resetting
+- Verify SSH credentials and connectivity
+- Check user permissions for `reset rpki session` command
+- Review logs in `/var/log/huawei_rpki/`
 
-<details>
-<summary><b>Sessions Not Resetting</b></summary>
+### Emails Not Received
+- Check spam/junk folder
+- Verify SMTP settings and firewall rules
+- Test SMTP connectivity: `telnet smtp_server port`
+- Check logs for SMTP errors
 
-```bash
-# Check SSH connectivity
-ssh admin@router_ip "display rpki session"
+### False Positives
+- Adjust the Negotiation timeout threshold in the code (default: 30 minutes)
+- Verify network connectivity between router and RPKI servers
 
-# Verify permissions
-ssh admin@router_ip "reset rpki session ?"
+---
 
-# Review logs
-tail -f /var/log/huawei_rpki/rpki_check_*.log
+## File Structure
+
 ```
-</details>
-
-<details>
-<summary><b>Email Alerts Not Received</b></summary>
-
-```bash
-# Test SMTP connectivity
-telnet smtp_server 587
-
-# Check email logs
-grep -i "smtp\|email" /var/log/huawei_rpki/*.log
-
-# Verify spam filters
-# Check junk/spam folders
-```
-</details>
-
-<details>
-<summary><b>High CPU/Memory Usage</b></summary>
-
-```bash
-# Check process
-ps aux | grep HuaweiRPKICheck
-
-# Review cron frequency
-crontab -l | grep HuaweiRPKICheck
-
-# Analyze logs for loops
-grep -i "error\|exception" /var/log/huawei_rpki/*.log
-```
-</details>
-
----
-
-## 📈 Performance Metrics
-
-| Metric | Value | Target |
-|--------|-------|--------|
-| Detection Time | <15 minutes | ✅ |
-| Recovery Time | <30 minutes | ✅ |
-| False Positives | <1% | ✅ |
-| Uptime | 99.9% | ✅ |
-| Email Delivery | 100% | ✅ |
-
----
-
-## 🔒 Security Considerations
-
-### Implemented Safeguards
-
-- ✅ **AES-256 encryption** for stored credentials
-- ✅ **No hardcoded secrets** in source code
-- ✅ **Secure file permissions** enforcement
-- ✅ **SSH timeout protection** against hanging connections
-- ✅ **Rate limiting** for email alerts
-
-### Compliance
-
-- **PCI DSS**: Encrypted credential storage
-- **ISO 27001**: Access control and monitoring
-- **NIST**: Automated security response
-
----
-
-## 🚀 Roadmap
-
-### Planned Features
-
-- [ ] **v2.1**: REST API for integration
-- [ ] **v2.2**: Multi-router support
-- [ ] **v2.3**: SSH key authentication
-- [ ] **v3.0**: Web dashboard with metrics
-- [ ] **v3.1**: Slack/Teams notifications
-- [ ] **v3.2**: SNMP trap integration
-
----
-
-## 🤝 Contributing
-
-We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
-
-```bash
-# Development setup
-git clone https://github.com/paolokappa/HuaweiRPKICheck.git
-cd HuaweiRPKICheck
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements-dev.txt
+/opt/HuaweiRPKICheck/
+├── HuaweiRPKICheck.py        # Main monitoring script
+├── HuaweiRPKI_credgen.py     # Credential encryption utility
+├── HuaweiRPKICheck.conf      # Encrypted configuration
+├── secret.key                # Encryption key (protect this!)
+├── rpki_state.json           # State tracking file
+└── /var/log/huawei_rpki/     # Log directory
+    └── rpki_check_YYYYMM.log # Monthly rotating logs
 ```
 
 ---
 
-## 📄 License
+## Security Considerations
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-```
-MIT License
-
-Copyright (c) 2024 Paolo Caparrelli / GOLINE SA
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction...
-```
+1. **Never commit** `secret.key` or unencrypted configuration files to version control
+2. Set restrictive permissions on sensitive files:
+   ```bash
+   chmod 600 secret.key HuaweiRPKICheck.conf
+   chmod 700 HuaweiRPKICheck.py
+   ```
+3. Use strong, unique passwords for router and SMTP access
+4. Consider implementing SSH key-based authentication (future enhancement)
+5. Regularly rotate credentials and encryption keys
 
 ---
 
-## 👥 Support
+## Version History
 
-### Getting Help
+### v2.0 (2024-09)
+- Added automatic recovery detection and notifications
+- Implemented smart timeout for stuck Negotiation sessions
+- Redesigned email templates with consistent styling
+- Added persistent state management
+- Improved error handling and logging
+- Enhanced session analysis logic
 
-- 📧 **Email**: [support@goline.ch](mailto:support@goline.ch)
-- 🐛 **Issues**: [GitHub Issues](https://github.com/paolokappa/HuaweiRPKICheck/issues)
-- 📖 **Wiki**: [Documentation Wiki](https://github.com/paolokappa/HuaweiRPKICheck/wiki)
-
-### Professional Support
-
-For enterprise support, custom development, or training:
-- **GOLINE SA**: [www.goline.ch](https://www.goline.ch)
-- **Contact**: +41 91 647 11 11
-
----
-
-## 🙏 Acknowledgments
-
-- **Huawei Support Team** - For bug confirmation and workaround validation
-- **Network Engineering Community** - For testing and feedback
-- **GOLINE SA** - For sponsoring development and production testing
-- **Open Source Contributors** - For libraries and tools
+### v1.0 (2024)
+- Initial release
+- Basic RPKI session monitoring
+- Automatic session reset for problematic states
+- Email alerts for session issues
 
 ---
 
-<div align="center">
+## Known Issues and Limitations
 
-### Built with ❤️ by [Paolo Caparrelli](https://github.com/paolokappa)
+- Huawei NetEngine bug: RPKI sessions don't automatically recover after server outage (this project works around this issue)
+- Maximum email frequency: Problem alerts once per hour, recovery alerts once per 30 minutes
+- SSH password authentication only (key-based auth planned for future)
 
-*Ensuring routing security, one session at a time*
+---
 
-**[⬆ back to top](#huaweirpkicheck)**
+## Contributing
 
-</div>
+Contributions are welcome! Please:
+1. Fork the repository
+2. Create a feature branch
+3. Test your changes thoroughly
+4. Submit a pull request with clear description
+
+---
+
+## License
+
+MIT License - See LICENSE file for details
+
+---
+
+## Author
+
+Paolo Kappa - [GitHub](https://github.com/paolokappa)
+
+---
+
+## Support
+
+For issues, questions, or suggestions:
+- Open an issue on [GitHub](https://github.com/paolokappa/HuaweiRPKICheck/issues)
+- Check the logs in `/var/log/huawei_rpki/` for debugging
+
+---
+
+## Acknowledgments
+
+- Thanks to the network engineering community for identifying and documenting the Huawei RPKI session bug
+- GOLINE SA for supporting the development and testing of this solution
