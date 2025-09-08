@@ -2,6 +2,35 @@
 
 All notable changes to HuaweiRPKICheck project will be documented in this file.
 
+## [3.2.0] - 2025-09-08
+
+### Added
+- Combined best features from v2.0 and v3.1
+- Full email functionality with HTML templates
+- Professional GOLINE SA branding in emails
+- Anti-spam mechanism (1-hour cooldown between alerts)
+- Recovery notifications when sessions restore
+
+### Fixed
+- **Critical**: Fixed cron exit codes - now returns 0 for warnings
+- Email system fully operational (was missing in v3.1)
+- Removed unnecessary wrapper script
+
+### Changed
+- **Improved timeout settings from v3.1:**
+  - NEGOTIATION_TIMEOUT: Still 3 minutes for fast recovery
+  - CONNECTION_TIMEOUT: 30 seconds
+  - COMMAND_TIMEOUT: 20 seconds
+- Unified class name to `RPKIChecker`
+- Exit code handling moved to Python script
+- Maintained backward compatibility with existing cron jobs
+
+### Current Status
+- **Email**: ✅ Working (soc@goline.ch)
+- **Cron**: ✅ No errors  
+- **Timeout**: ✅ 3-minute negotiation
+- **Exit Codes**: ✅ Fixed
+
 ## [3.1.0] - 2025-09-08
 
 ### Fixed
