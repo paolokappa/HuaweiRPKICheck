@@ -1,5 +1,13 @@
 # Claude AI Assistant Instructions
 
+## Project Information
+**Project**: HuaweiRPKICheck  
+**Developer**: Paolo Caparrelli  
+**Company**: GOLINE SA  
+**Address**: Via Croce Campagna, 2 - 6855 Stabio - Switzerland  
+**Website**: https://www.goline.ch  
+**Support Email**: soc@goline.ch  
+
 ## Project Overview
 HuaweiRPKICheck is a monitoring tool for RPKI sessions on Huawei routers with Routinator integration. It monitors session states, detects issues, and automatically recovers stuck sessions.
 

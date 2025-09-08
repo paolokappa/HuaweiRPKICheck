@@ -389,12 +389,28 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
+## 👨‍💻 Author
+
+<div align="center">
+
+**Paolo Caparrelli**  
+[GOLINE SA](https://www.goline.ch)  
+Via Croce Campagna, 2 - 6855 Stabio - Switzerland  
+
+[![Website](https://img.shields.io/badge/Website-goline.ch-blue?style=flat-square)](https://www.goline.ch)
+[![Email](https://img.shields.io/badge/Email-soc@goline.ch-red?style=flat-square)](mailto:soc@goline.ch)
+
+</div>
+
+---
+
 ## 🙏 Acknowledgments
 
 <div align="center">
 
 | Organization | Contribution |
 |--------------|--------------|
+| **GOLINE SA** | Development and maintenance |
 | **Huawei** | Router platform and RPKI implementation |
 | **NLnet Labs** | Routinator RPKI validator |
 | **Python Community** | Paramiko and Cryptography libraries |
@@ -412,7 +428,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 [![GitHub Issues](https://img.shields.io/badge/GitHub-Issues-black?style=for-the-badge&logo=github)](https://github.com/paolokappa/HuaweiRPKICheck/issues)
 [![Documentation](https://img.shields.io/badge/Read-Docs-blue?style=for-the-badge&logo=readthedocs)](docs/)
-[![Email](https://img.shields.io/badge/Email-Support-red?style=for-the-badge&logo=gmail)](mailto:support@example.com)
+[![Email](https://img.shields.io/badge/Email-Support-red?style=for-the-badge&logo=gmail)](mailto:soc@goline.ch)
 
 </div>
 
@@ -428,10 +444,12 @@ If this project helps you, please consider giving it a ⭐️
 
 ---
 
-**Made with ❤️ for Network Engineers**
+**Made with ❤️ by [GOLINE SA](https://www.goline.ch) for Network Engineers**
 
 <img src="https://img.shields.io/badge/Network-Engineering-orange?style=for-the-badge" />
 <img src="https://img.shields.io/badge/BGP-Security-blue?style=for-the-badge" />
 <img src="https://img.shields.io/badge/RPKI-Validation-green?style=for-the-badge" />
+
+**© 2024-2025 GOLINE SA - Switzerland**
 
 </div>

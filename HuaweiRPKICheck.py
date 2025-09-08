@@ -3,6 +3,13 @@
 """
 Huawei RPKI Check v3.1 - Improved timeout and reconnection handling
 Enhanced for better stability with Routinator connections
+
+Author: Paolo Caparrelli
+Company: GOLINE SA - Switzerland
+Website: https://www.goline.ch
+Support: soc@goline.ch
+License: MIT
+Copyright (c) 2024-2025 GOLINE SA
 """
 
 import paramiko
