@@ -278,15 +278,15 @@ BACKOFF_MULTIPLIER = 5      # Exponential backoff
 
 ```
 ╔════════════════════════════════════════════════════════════╗
-║                    RPKI Session Monitor                     ║
+║                    RPKI Session Monitor                    ║
 ╠════════════════════════════════════════════════════════════╣
-║ Total Sessions : 2                                          ║
-║ Established    : 2 ✅                                       ║
+║ Total Sessions : 2                                         ║
+║ Established    : 2 ✅                                      ║
 ║ Idle          : 0                                          ║
 ║ Negotiating   : 0                                          ║
 ║ Need Reset    : 0                                          ║
 ╠════════════════════════════════════════════════════════════╣
-║ Health Status : HEALTHY ✅                                  ║
+║ Health Status : HEALTHY ✅                                 ║
 ╚════════════════════════════════════════════════════════════╝
 
 Session Details:
