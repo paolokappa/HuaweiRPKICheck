@@ -15,7 +15,7 @@ import sys
 
 # Configuration
 ROUTINATOR_SERVERS = ['lg.goline.ch', 'time.goline.ch']
-ROUTER_IP = '185.54.81.25'
+ROUTER_IP = 'YOUR_ROUTER_IP'  # Replace with your router IP
 RTR_PORT = 3323
 HTTP_PORT = 8323
 LOG_FILE = Path("/var/log/huawei_rpki/routinator_monitor_complete.log")

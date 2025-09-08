@@ -352,9 +352,10 @@ class HuaweiRPKIChecker:
         
         # Enhanced patterns for different session states
         session_patterns = [
-            # Pattern for session lines with IP, port, and state
+            # Pattern for Huawei display rpki session format
+            r'(\d+\.\d+\.\d+\.\d+)\s+(Established|Idle|Negotiation|Syn)\s+(\S+)\s+(\d+)/(\d+)',
+            # Alternative patterns
             r'(\d+\.\d+\.\d+\.\d+)\s+(\d+)\s+\d+\s+\d+\s+(\w+)',
-            # Alternative pattern
             r'(\d+\.\d+\.\d+\.\d+)\s+(\w+)\s+(\d+)\s+Records'
         ]
         
@@ -362,30 +363,37 @@ class HuaweiRPKIChecker:
             for pattern in session_patterns:
                 match = re.search(pattern, line)
                 if match:
-                    ip = match.group(1)
-                    
-                    # Determine state and records
-                    if 'establish' in line.lower():
-                        state = 'Established'
-                        # Extract record count
-                        record_match = re.search(r'(\d+)\s+Records', line)
-                        records = int(record_match.group(1)) if record_match else 0
-                    elif 'idle' in line.lower():
-                        state = 'Idle'
-                        records = 0
-                    elif 'negot' in line.lower():
-                        state = 'Negotiation'
-                        records = 0
-                    elif 'syn' in line.lower() or 'sync' in line.lower():
-                        state = 'Syn'
-                        records = 0
+                    # Handle different pattern matches
+                    if pattern == session_patterns[0]:  # Huawei format
+                        ip = match.group(1)
+                        state = match.group(2)
+                        age = match.group(3)
+                        records = int(match.group(4))  # IPv4 records
                     else:
-                        state = 'Unknown'
-                        records = 0
-                    
-                    # Extract age information
-                    age_match = re.search(r'Age:\s*([^\s]+)', line)
-                    age = age_match.group(1) if age_match else 'Unknown'
+                        ip = match.group(1)
+                        
+                        # Determine state and records from line content
+                        if 'establish' in line.lower():
+                            state = 'Established'
+                            # Extract record count
+                            record_match = re.search(r'(\d+)/\d+', line)
+                            records = int(record_match.group(1)) if record_match else 0
+                        elif 'idle' in line.lower():
+                            state = 'Idle'
+                            records = 0
+                        elif 'negot' in line.lower():
+                            state = 'Negotiation'
+                            records = 0
+                        elif 'syn' in line.lower() or 'sync' in line.lower():
+                            state = 'Syn'
+                            records = 0
+                        else:
+                            state = 'Unknown'
+                            records = 0
+                        
+                        # Extract age information
+                        age_match = re.search(r'(\d+[dhms]+\d*[hms]*\d*[ms]*)', line)
+                        age = age_match.group(1) if age_match else 'Unknown'
                     
                     session = {
                         'ip': ip,
@@ -585,7 +593,7 @@ class HuaweiRPKIChecker:
             # Analyze sessions
             analysis = self.analyze_sessions(sessions)
             
-            logger.info(f"Session status: {len(analysis['total'])} total, "
+            logger.info(f"Session status: {analysis['total']} total, "
                        f"{len(analysis['established'])} established, "
                        f"{len(analysis['idle'])} idle, "
                        f"{len(analysis['negotiation'])} negotiating")
