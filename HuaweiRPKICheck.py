@@ -301,6 +301,9 @@ class RPKIChecker:
             
         try:
             logger.debug(f"Executing command: {command}")
+            
+            # For display commands, exec_command works fine in USER mode
+            # For reset commands, we need special handling (see reset_sessions method)
             stdin, stdout, stderr = self.ssh_client.exec_command(
                 command, timeout=timeout
             )
@@ -311,7 +314,10 @@ class RPKIChecker:
             output = stdout.read().decode('utf-8', errors='ignore')
             error = stderr.read().decode('utf-8', errors='ignore')
             
-            if exit_status != 0:
+            # Huawei returns -1 for many commands but still provides output
+            if exit_status != 0 and output:
+                logger.debug(f"Command returned exit status {exit_status} but has output")
+            elif exit_status != 0:
                 logger.warning(f"Command '{command}' returned non-zero exit status {exit_status}")
                 if error:
                     logger.warning(f"Error output: {error}")
@@ -593,7 +599,7 @@ class RPKIChecker:
         return analysis
     
     def reset_sessions(self, sessions_to_reset: List[str]) -> bool:
-        """Reset specified RPKI sessions using interactive shell in USER mode"""
+        """Reset specified RPKI sessions - MUST reconnect SSH for each reset on Huawei"""
         if self.test_mode:
             logger.info(f"TEST MODE: Would reset sessions: {sessions_to_reset}")
             return True
@@ -604,51 +610,132 @@ class RPKIChecker:
         for session_ip in sessions_to_reset:
             logger.info(f"Attempting to reset session: {session_ip}")
             
-            # Use interactive shell method which works in USER mode
-            command = f"reset rpki session {session_ip}"
-            logger.info(f"Executing reset via interactive shell for {session_ip}")
+            # Store the age before reset to verify later
+            before_age = None
+            check_output = self.execute_command("display rpki session", timeout=10)
+            if check_output and session_ip in check_output:
+                for line in check_output.split('\n'):
+                    if session_ip in line:
+                        parts = re.split(r'\s+', line.strip())
+                        if len(parts) >= 3:
+                            before_age = parts[2]
+                            logger.info(f"Session {session_ip} age before reset: {before_age}")
+                            break
             
-            shell_result = self.execute_command_shell(command, timeout=10)
+            # For Huawei, we need to reconnect for reset commands
+            # Save current connection state
+            old_client = self.ssh_client
             
-            if shell_result:
-                # Check for errors in output
-                if "Error" in shell_result or "Invalid" in shell_result or "Unrecognized" in shell_result:
-                    logger.error(f"Reset command failed for {session_ip}: {shell_result}")
-                    reset_results[session_ip] = "failed"
-                    success = False
-                else:
-                    # Command executed successfully
-                    logger.info(f"Session {session_ip} reset command sent successfully")
-                    reset_results[session_ip] = "reset"
-                    
-                    # Wait for the reset to take effect (session goes through Idle -> SYN -> Negotiation -> Established)
-                    time.sleep(3)
-                    
-                    # Verify the reset by checking session status
-                    verify_output = self.execute_command_shell("display rpki session", timeout=10)
-                    if verify_output:
-                        # Parse the output to check new state
-                        if session_ip in verify_output:
-                            lines = verify_output.split('\n')
-                            for line in lines:
-                                if session_ip in line:
-                                    # Extract state from line
-                                    parts = line.split()
-                                    if len(parts) > 1:
-                                        new_state = parts[1] if parts[0] == session_ip else parts[2] if len(parts) > 2 else "Unknown"
-                                        logger.info(f"Post-reset status for {session_ip}: {new_state}")
-                                        reset_results[session_ip] += f" -> {new_state}"
-                                    break
-            else:
-                logger.error(f"No response received for reset command on {session_ip}")
-                reset_results[session_ip] = "no_response"
+            try:
+                # Create new connection for reset
+                logger.info(f"Creating new SSH connection for reset command")
+                reset_client = paramiko.SSHClient()
+                reset_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                reset_client.connect(
+                    self.config['hostname'],
+                    username=self.config['username'],
+                    password=self.config['password'],
+                    timeout=30
+                )
+                
+                # Use shell on new connection
+                shell = reset_client.invoke_shell()
+                time.sleep(2)
+                
+                # Clear initial output
+                while shell.recv_ready():
+                    shell.recv(4096)
+                    time.sleep(0.2)
+                
+                # IMPORTANT: Reset command must be sent in USER mode, NOT system-view
+                # The shell starts in USER mode by default on Huawei
+                reset_cmd = f"reset rpki session {session_ip}"
+                logger.info(f"Sending reset command in USER mode: {reset_cmd}")
+                shell.send(reset_cmd + "\n")
+                
+                # Wait for command to process
+                time.sleep(3)
+                
+                # Try to get any output
+                output = ""
+                attempts = 0
+                while attempts < 5:
+                    if shell.recv_ready():
+                        chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                        output += chunk
+                        # Check for confirmation
+                        if any(word in chunk.lower() for word in ['confirm', 'continue', '[y/n]']):
+                            logger.info("Confirmation prompt detected, sending 'y'")
+                            shell.send("y\n")
+                            time.sleep(1)
+                    attempts += 1
+                    time.sleep(0.5)
+                
+                shell.close()
+                reset_client.close()
+                
+                # Log that reset command was sent
+                logger.info(f"Reset command sent for {session_ip}")
+                reset_results[session_ip] = "reset_sent"
+                
+                # Wait for reset to take effect
+                logger.info(f"Waiting 10 seconds for reset to take effect...")
+                time.sleep(10)
+                
+                # Always reconnect after reset as Huawei may close the connection
+                logger.info("Reconnecting main SSH client after reset")
+                if old_client:
+                    try:
+                        old_client.close()
+                    except:
+                        pass
+                
+                # Reconnect for verification
+                if not self.ssh_connect():
+                    logger.error("Failed to reconnect after reset")
+                    # Try one more time
+                    time.sleep(2)
+                    self.ssh_connect()
+                
+                # Verify the reset by checking session status
+                verify_output = self.execute_command("display rpki session", timeout=10)
+                if verify_output and session_ip in verify_output:
+                    for line in verify_output.split('\n'):
+                        if session_ip in line:
+                            parts = re.split(r'\s+', line.strip())
+                            if len(parts) >= 3:
+                                new_state = parts[1]
+                                new_age = parts[2]
+                                logger.info(f"Post-reset: {session_ip} is {new_state} with age {new_age}")
+                                
+                                # Check if age indicates recent reset (seconds only)
+                                if 's' in new_age and ('m' not in new_age or '00m' in new_age):
+                                    logger.info(f"✅ Reset successful! {session_ip} age shows recent reset: {new_age}")
+                                    reset_results[session_ip] = f"success -> {new_state} ({new_age})"
+                                elif before_age and before_age != new_age:
+                                    logger.info(f"Age changed from {before_age} to {new_age}")
+                                    reset_results[session_ip] = f"age_changed -> {new_state}"
+                                else:
+                                    logger.warning(f"Reset may have failed, age unchanged: {new_age}")
+                                    reset_results[session_ip] = "uncertain"
+                                break
+                
+            except Exception as e:
+                logger.error(f"Failed to reset {session_ip}: {e}")
+                reset_results[session_ip] = "failed"
                 success = False
+                
+                # Try to restore connection
+                if old_client:
+                    self.ssh_client = old_client
+                    if not self.ssh_client.get_transport() or not self.ssh_client.get_transport().is_active():
+                        self.ssh_connect()
         
         # Log summary of reset operations
         logger.info(f"Reset operation summary: {reset_results}")
         
         # Add recovery monitoring info to state
-        if success and reset_results:
+        if reset_results:
             self.state['last_reset'] = datetime.now().isoformat()
             self.state['reset_sessions'] = list(reset_results.keys())
         
