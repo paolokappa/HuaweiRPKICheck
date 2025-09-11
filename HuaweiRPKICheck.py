@@ -812,6 +812,171 @@ class RPKIChecker:
         
         return success
     
+    def send_status_report(self, sessions: List[Dict], analysis: Dict, html_table: str) -> bool:
+        """Send a status report email regardless of health status"""
+        # Determine status emoji and text
+        if analysis['healthy']:
+            status_emoji = "✅"
+            status_text = "All Systems Operational"
+            header_color = "#28a745"
+        else:
+            status_emoji = "⚠️"
+            status_text = f"Issues Detected: {', '.join(analysis['issues'])}"
+            header_color = "#ffc107"
+        
+        subject = f"[RPKI Monitor] {status_emoji} Status Report - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        
+        body = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    line-height: 1.3;
+                    color: #333;
+                    background-color: #f5f7fa;
+                    margin: 0;
+                    padding: 0;
+                }}
+                .container {{
+                    max-width: 800px;
+                    margin: 0 auto;
+                    background: white;
+                    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                }}
+                .header-block {{
+                    background: #1e3c72;
+                    color: white;
+                    padding: 15px 20px;
+                    border-bottom: 3px solid {header_color};
+                }}
+                .header-block h1 {{
+                    margin: 0;
+                    font-size: 20px;
+                    font-weight: 400;
+                }}
+                .header-block .subtitle {{
+                    font-size: 12px;
+                    color: #b8d4f1;
+                    margin: 0;
+                }}
+                .status-text {{
+                    color: #ffeb3b;
+                    font-weight: bold;
+                    font-size: 13px;
+                }}
+                .content {{
+                    padding: 15px 20px;
+                }}
+                .info-grid {{
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 10px;
+                    margin: 10px 0;
+                    padding: 10px;
+                    background: #f8f9fb;
+                    border-radius: 4px;
+                    font-size: 13px;
+                }}
+                .info-item {{
+                    display: flex;
+                    align-items: center;
+                }}
+                .info-label {{
+                    font-weight: 600;
+                    color: #1e3c72;
+                    margin-right: 6px;
+                }}
+                .section-title {{
+                    color: #1e3c72;
+                    border-bottom: 1px solid #e1e8f0;
+                    padding-bottom: 2px;
+                    margin: 10px 0 0 0;
+                    font-size: 14px;
+                }}
+                .footer {{
+                    background: #1e3c72;
+                    color: #b8d4f1;
+                    padding: 10px;
+                    text-align: center;
+                    font-size: 11px;
+                }}
+                .footer a {{
+                    color: #fff;
+                    text-decoration: none;
+                }}
+                .status-box {{
+                    background: {'#d4edda' if analysis['healthy'] else '#fff3cd'};
+                    border-left: 3px solid {header_color};
+                    padding: 8px 10px;
+                    margin: 10px 0;
+                    border-radius: 3px;
+                    font-size: 13px;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header-block">
+                    <div style="line-height: 1.2;">
+                        <h1 style="margin: 0;">HUAWEI RPKI MONITOR - STATUS REPORT</h1>
+                        <div class="subtitle">Manual Status Check</div>
+                        <div class="status-text">{status_emoji} {status_text}</div>
+                    </div>
+                </div>
+                
+                <div class="content">
+                    <div class="info-grid">
+                        <div class="info-item">
+                            <span class="info-label">🕐 Time:</span>
+                            <span>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} CET</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">🖥 Device:</span>
+                            <span>{self.config['hostname']}</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">📊 Total Sessions:</span>
+                            <span>{analysis['total']}</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">✅ Established:</span>
+                            <span>{len(analysis['established'])}</span>
+                        </div>
+                    </div>
+                    
+                    <div class="status-box">
+                        <strong>Current Status Summary:</strong>
+                        <ul style="margin: 5px 0; padding-left: 20px;">
+                            <li>Established: {len(analysis['established'])} sessions</li>
+                            <li>Idle: {len(analysis['idle'])} sessions</li>
+                            <li>Negotiating: {len(analysis['negotiation'])} sessions</li>
+                            <li>SYN: {len(analysis['syn'])} sessions</li>
+                            {'<li>Issues: ' + ', '.join(analysis['issues']) + '</li>' if analysis['issues'] else ''}
+                        </ul>
+                    </div>
+                    
+                    <h2 class="section-title">📊 Session Details</h2>
+                    {html_table}
+                    
+                    <div style="margin-top: 20px; padding: 10px; background: #f0f4f8; border-radius: 4px; font-size: 12px;">
+                        <strong>Note:</strong> This is a manual status report requested via --check-status command.
+                    </div>
+                </div>
+                
+                <div class="footer">
+                    <strong>GOLINE SA</strong> | Via Croce Campagna 2, 6855 Stabio, Switzerland | 📧 <a href="mailto:noc@goline.ch">noc@goline.ch</a><br>
+                    <span style="opacity: 0.8;">Status report from HuaweiRPKICheck v3.6</span>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        return self.send_alert_email(subject, body)
+    
     def send_alert_email(self, subject: str, body: str) -> bool:
         """Send alert email with improved error handling"""
         if self.test_mode:
@@ -1399,6 +1564,7 @@ def main():
     parser = argparse.ArgumentParser(description='Huawei RPKI Session Checker v3.6')
     parser.add_argument('--test', action='store_true', help='Run in test mode (no changes, no emails)')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
+    parser.add_argument('--check-status', action='store_true', help='Force send current status report via email')
     parser.add_argument('--config', type=str, default=str(CONFIG_FILE), help='Path to config file')
     parser.add_argument('--key', type=str, default=str(SECRET_KEY_FILE), help='Path to key file')
     
@@ -1419,7 +1585,46 @@ def main():
         config = checker.decrypt_config(Path(args.key), Path(args.config))
         checker.config = config
         
-        # Run the check
+        # Handle --check-status option
+        if args.check_status:
+            logger.info("Running status check and sending report...")
+            
+            # Connect and get status
+            if not checker.ssh_connect():
+                logger.error("Failed to connect for status check")
+                sys.exit(1)
+            
+            # Get current status
+            output = checker.execute_command("display rpki session")
+            if not output:
+                logger.error("No output received from RPKI command")
+                sys.exit(1)
+            
+            # Parse and analyze
+            sessions, html_table = checker.parse_rpki_output(output)
+            analysis = checker.analyze_sessions(sessions)
+            
+            # Log status
+            logger.info(f"Status: {analysis['total']} total, "
+                       f"{len(analysis['established'])} established, "
+                       f"{len(analysis['idle'])} idle, "
+                       f"{len(analysis['negotiation'])} negotiating")
+            
+            # Send status report email
+            if checker.send_status_report(sessions, analysis, html_table):
+                print(f"✅ Status report sent to {checker.config['email_receiver']}")
+                logger.info("Status report email sent successfully")
+            else:
+                print(f"❌ Failed to send status report")
+                logger.error("Failed to send status report email")
+            
+            # Close connection
+            if checker.ssh_client:
+                checker.ssh_client.close()
+            
+            sys.exit(0)
+        
+        # Normal operation - run the check
         success = checker.run_check()
         
         sys.exit(0 if success else 1)
