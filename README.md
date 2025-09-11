@@ -453,3 +453,30 @@ If this project helps you, please consider giving it a ⭐️
 **© 2024-2025 GOLINE SA - Switzerland**
 
 </div>
+
+---
+
+## 📝 Version History
+
+### v3.6.0 (September 2025)
+- ✨ Outlook-compatible HTML email templates
+- 🎨 Professional corporate-friendly design
+- 📱 Mobile responsive email layout
+- 🔒 Enhanced security with inline styles
+- 📊 Improved status reporting tables
+
+### v3.2.0 (September 2025)
+- 🔧 Combined v2.0 email functionality with v3.1 improvements
+- ⚡ Fixed cron exit codes
+- 🚀 Reduced negotiation timeout to 3 minutes
+- 📧 Working email system to soc@goline.ch
+
+### v3.1.0 (August 2025)
+- 🐛 Fixed RTR protocol packet format
+- ⏱️ Enhanced timeout management
+- 🔄 Improved session recovery logic
+
+### v2.0.0 (July 2025)
+- 📧 Added email notification system
+- 🛡️ Improved error handling
+- 📊 Enhanced logging capabilities
