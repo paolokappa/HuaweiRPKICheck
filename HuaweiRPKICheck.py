@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Huawei RPKI Check v3.2 - Enhanced version with improved timeout and email handling
+Huawei RPKI Check v3.6 - Added Routinator issue detection and partial prefix monitoring
 Combines v2.0 email functionality with v3.1 timeout improvements
 
 Author: Paolo Caparrelli
@@ -208,6 +208,91 @@ class RPKIChecker:
                     
         return None
     
+    def execute_command_shell(self, command: str, timeout: int = 10) -> Optional[str]:
+        """Execute command via interactive shell in USER mode for Huawei devices"""
+        if not self.ssh_client:
+            logger.error("No SSH connection available")
+            return None
+        
+        shell = None
+        try:
+            # Always create a fresh shell for reset commands to avoid state issues
+            logger.debug("Creating fresh interactive shell session in USER mode")
+            shell = self.ssh_client.invoke_shell()
+            time.sleep(2)  # Increased wait for shell initialization
+            
+            # Clear any initial output (banner, etc.)
+            while shell.recv_ready():
+                initial_output = shell.recv(4096).decode('utf-8', errors='ignore')
+                logger.debug(f"Initial output: {initial_output[:200]}...")
+                time.sleep(0.5)
+            
+            # Send the command
+            logger.info(f"Sending command via shell: {command}")
+            shell.send(command + "\n")
+            
+            # Wait for output - special handling for reset commands
+            time.sleep(2)  # Give command time to execute
+            output = ""
+            received_prompt = False
+            start_time = time.time()
+            
+            # Try to get output for a shorter time for reset commands
+            max_wait = 5 if "reset" in command else timeout
+            
+            while time.time() - start_time < max_wait:
+                if shell.recv_ready():
+                    chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                    output += chunk
+                    logger.debug(f"Received chunk: {chunk[:200]}...")
+                    
+                    # Check for confirmation prompts
+                    if "confirm" in chunk.lower() or "[y/n]" in chunk.lower() or "Continue?" in chunk:
+                        logger.info("Confirmation prompt detected, sending 'y'")
+                        shell.send("y\n")
+                        time.sleep(1)
+                        if shell.recv_ready():
+                            confirm_output = shell.recv(4096).decode('utf-8', errors='ignore')
+                            output += confirm_output
+                    
+                    # Check for common prompts indicating command completion
+                    if any(prompt in chunk for prompt in ['<netengine', '>', '#', ']']):
+                        received_prompt = True
+                        logger.debug(f"Prompt detected, command likely completed")
+                        break
+                else:
+                    # For reset commands, consider success if we sent the command
+                    if "reset" in command and time.time() - start_time > 3:
+                        logger.info("Reset command sent, assuming success")
+                        output = "Reset command sent successfully"
+                        break
+                    time.sleep(0.5)
+            
+            # For reset commands, success is indicated by no error messages
+            if "reset" in command:
+                if "Error" not in output and "Invalid" not in output and "Unrecognized" not in output:
+                    logger.info(f"Reset command executed successfully for: {command}")
+                    return "Reset command executed successfully"
+                else:
+                    logger.error(f"Reset command failed with output: {output}")
+                    return None
+            
+            logger.debug(f"Shell command output: {output[:500]}...")
+            return output if output else "Command executed"
+            
+        except Exception as e:
+            logger.error(f"Failed to execute shell command '{command}': {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return None
+        finally:
+            # Always close the shell after use
+            if shell:
+                try:
+                    shell.close()
+                except:
+                    pass
+    
     def execute_command(self, command: str, timeout: int = 30) -> Optional[str]:
         """Execute command via SSH with proper output handling"""
         if not self.ssh_client:
@@ -215,6 +300,7 @@ class RPKIChecker:
             return None
             
         try:
+            logger.debug(f"Executing command: {command}")
             stdin, stdout, stderr = self.ssh_client.exec_command(
                 command, timeout=timeout
             )
@@ -226,9 +312,11 @@ class RPKIChecker:
             error = stderr.read().decode('utf-8', errors='ignore')
             
             if exit_status != 0:
-                logger.warning(f"Command returned non-zero exit status {exit_status}")
+                logger.warning(f"Command '{command}' returned non-zero exit status {exit_status}")
                 if error:
                     logger.warning(f"Error output: {error}")
+            
+            logger.debug(f"Command output: {output[:200]}..." if len(output) > 200 else f"Command output: {output}")
             
             return output
             
@@ -421,26 +509,47 @@ class RPKIChecker:
         analysis = {
             'total': len(sessions),
             'established': [],
+            'partial': [],  # Sessions with missing IPv4 or IPv6 prefixes
             'idle': [],
             'negotiation': [],
             'syn': [],
             'need_reset': [],
             'healthy': True,
-            'issues': []
+            'issues': [],
+            'routinator_issues': []  # Track potential Routinator problems
         }
         
         # Use the global timeout setting
         negotiation_timeout = NEGOTIATION_TIMEOUT_MINUTES
+        syn_timeout = 2  # Reset SYN sessions stuck for more than 2 minutes
         
         for session in sessions:
             state = session['state'].lower()
             
-            if state == 'established' and session['ipv4_count'] > 0:
-                analysis['established'].append(session['ip'])
+            if state == 'established':
+                # Check if session has both IPv4 and IPv6 prefixes
+                if session['ipv4_count'] > 0 and session['ipv6_count'] > 0:
+                    analysis['established'].append(session['ip'])
+                elif session['ipv4_count'] == 0 and session['ipv6_count'] > 0:
+                    # Missing IPv4 prefixes - likely Routinator issue
+                    analysis['partial'].append(session['ip'])
+                    analysis['routinator_issues'].append(f"{session['ip']}: Missing IPv4 prefixes (0/{session['ipv6_count']})")
+                    logger.warning(f"Session {session['ip']} established but missing IPv4 prefixes - Routinator issue?")
+                elif session['ipv4_count'] > 0 and session['ipv6_count'] == 0:
+                    # Missing IPv6 prefixes
+                    analysis['partial'].append(session['ip'])
+                    analysis['routinator_issues'].append(f"{session['ip']}: Missing IPv6 prefixes ({session['ipv4_count']}/0)")
+                    logger.warning(f"Session {session['ip']} established but missing IPv6 prefixes")
+                else:
+                    # No prefixes at all despite being established
+                    analysis['idle'].append(session['ip'])
+                    analysis['need_reset'].append(session['ip'])
+                    
             elif state == 'idle':
                 analysis['idle'].append(session['ip'])
                 if session['ipv4_count'] == 0 and session['ipv6_count'] == 0:
                     analysis['need_reset'].append(session['ip'])
+                    
             elif state == 'negotiation':
                 analysis['negotiation'].append(session['ip'])
                 
@@ -452,11 +561,24 @@ class RPKIChecker:
                    (age_minutes > negotiation_timeout):
                     analysis['need_reset'].append(session['ip'])
                     logger.warning(f"Session {session['ip']} stuck in Negotiation for {session.get('age')} ({age_minutes} minutes) - will reset")
+                    
             elif state == 'syn':
                 analysis['syn'].append(session['ip'])
+                
+                # Check how long it's been in SYN state
+                age_minutes = self.parse_age_to_minutes(session.get('age', '0'))
+                
+                # Reset if stuck in SYN for too long
+                if age_minutes > syn_timeout:
+                    analysis['need_reset'].append(session['ip'])
+                    logger.warning(f"Session {session['ip']} stuck in SYN for {session.get('age')} ({age_minutes} minutes) - will reset")
+                    
+                    # If repeatedly stuck in SYN, likely a Routinator issue
+                    if session['ip'] in self.state.get('reset_sessions', []):
+                        analysis['routinator_issues'].append(f"{session['ip']}: Repeatedly stuck in SYN - check Routinator")
         
         # Determine health status
-        if analysis['idle'] or analysis['negotiation'] or analysis['syn']:
+        if analysis['idle'] or analysis['negotiation'] or analysis['syn'] or analysis['partial']:
             analysis['healthy'] = False
             
             if analysis['idle']:
@@ -465,26 +587,70 @@ class RPKIChecker:
                 analysis['issues'].append(f"{len(analysis['negotiation'])} negotiating sessions")
             if analysis['syn']:
                 analysis['issues'].append(f"{len(analysis['syn'])} syn sessions")
+            if analysis['partial']:
+                analysis['issues'].append(f"{len(analysis['partial'])} partial sessions (missing prefixes)")
         
         return analysis
     
     def reset_sessions(self, sessions_to_reset: List[str]) -> bool:
-        """Reset specified RPKI sessions"""
+        """Reset specified RPKI sessions using interactive shell in USER mode"""
         if self.test_mode:
             logger.info(f"TEST MODE: Would reset sessions: {sessions_to_reset}")
             return True
         
         success = True
+        reset_results = {}
+        
         for session_ip in sessions_to_reset:
-            command = f"reset rpki session {session_ip}"
-            logger.info(f"Resetting session: {session_ip}")
+            logger.info(f"Attempting to reset session: {session_ip}")
             
-            result = self.execute_command(command)
-            if result is None:
-                logger.error(f"Failed to reset session {session_ip}")
-                success = False
+            # Use interactive shell method which works in USER mode
+            command = f"reset rpki session {session_ip}"
+            logger.info(f"Executing reset via interactive shell for {session_ip}")
+            
+            shell_result = self.execute_command_shell(command, timeout=10)
+            
+            if shell_result:
+                # Check for errors in output
+                if "Error" in shell_result or "Invalid" in shell_result or "Unrecognized" in shell_result:
+                    logger.error(f"Reset command failed for {session_ip}: {shell_result}")
+                    reset_results[session_ip] = "failed"
+                    success = False
+                else:
+                    # Command executed successfully
+                    logger.info(f"Session {session_ip} reset command sent successfully")
+                    reset_results[session_ip] = "reset"
+                    
+                    # Wait for the reset to take effect (session goes through Idle -> SYN -> Negotiation -> Established)
+                    time.sleep(3)
+                    
+                    # Verify the reset by checking session status
+                    verify_output = self.execute_command_shell("display rpki session", timeout=10)
+                    if verify_output:
+                        # Parse the output to check new state
+                        if session_ip in verify_output:
+                            lines = verify_output.split('\n')
+                            for line in lines:
+                                if session_ip in line:
+                                    # Extract state from line
+                                    parts = line.split()
+                                    if len(parts) > 1:
+                                        new_state = parts[1] if parts[0] == session_ip else parts[2] if len(parts) > 2 else "Unknown"
+                                        logger.info(f"Post-reset status for {session_ip}: {new_state}")
+                                        reset_results[session_ip] += f" -> {new_state}"
+                                    break
             else:
-                logger.info(f"Session {session_ip} reset command sent")
+                logger.error(f"No response received for reset command on {session_ip}")
+                reset_results[session_ip] = "no_response"
+                success = False
+        
+        # Log summary of reset operations
+        logger.info(f"Reset operation summary: {reset_results}")
+        
+        # Add recovery monitoring info to state
+        if success and reset_results:
+            self.state['last_reset'] = datetime.now().isoformat()
+            self.state['reset_sessions'] = list(reset_results.keys())
         
         return success
     
@@ -824,7 +990,11 @@ class RPKIChecker:
             
             # Send alert if needed
             elif not analysis['healthy'] and self.should_send_alert(analysis):
-                subject = f"[RPKI Monitor] Alert: {', '.join(analysis['issues'])}"
+                # Check if this is a Routinator issue
+                if analysis.get('routinator_issues'):
+                    subject = f"[RPKI Monitor] ⚠️ ROUTINATOR ISSUE: {', '.join(analysis['routinator_issues'][:1])}"
+                else:
+                    subject = f"[RPKI Monitor] Alert: {', '.join(analysis['issues'])}"
                 
                 # Create professional HTML email with GOLINE branding
                 body = f"""
@@ -981,9 +1151,12 @@ class RPKIChecker:
                             
                             {'<div class="success-box"><strong>✓ Automatic Recovery:</strong> Sessions reset: ' + ', '.join(analysis['need_reset']) + '</div>' if analysis['need_reset'] else ''}
                             
+                            {'<div class="warning-box" style="background: #f8d7da; border-left-color: #dc3545;"><strong>🚨 Routinator Server Issues Detected:</strong><ul>' + ''.join([f'<li>{issue}</li>' for issue in analysis.get('routinator_issues', [])]) + '</ul><strong>Action Required:</strong> Check Routinator service on affected servers</div>' if analysis.get('routinator_issues') else ''}
+                            
                             <div class="warning-box">
                                 <strong>💡 Recommended Actions:</strong>
                                 <ul>
+                                    {'<li><strong>URGENT:</strong> Check Routinator services on affected servers</li><li>Restart Routinator: systemctl restart routinator</li><li>Check logs: journalctl -u routinator -n 100</li>' if analysis.get('routinator_issues') else ''}
                                     <li>Review RPKI server connectivity</li>
                                     <li>Check BGP peering status</li>
                                     <li>Verify network path to RPKI validators</li>
@@ -1038,7 +1211,7 @@ import email.utils
 
 def main():
     """Main entry point with argument parsing"""
-    parser = argparse.ArgumentParser(description='Huawei RPKI Session Checker v2.0')
+    parser = argparse.ArgumentParser(description='Huawei RPKI Session Checker v3.6')
     parser.add_argument('--test', action='store_true', help='Run in test mode (no changes, no emails)')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
     parser.add_argument('--config', type=str, default=str(CONFIG_FILE), help='Path to config file')
