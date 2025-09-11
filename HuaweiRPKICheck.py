@@ -863,7 +863,7 @@ class RPKIChecker:
         return False
     
     def should_send_alert(self, analysis: Dict) -> bool:
-        """Determine if an alert should be sent based on state and history"""
+        """Determine if an alert should be sent - more intelligent logic"""
         if analysis['healthy']:
             return False
         
@@ -871,13 +871,53 @@ class RPKIChecker:
         if self.test_mode:
             return True
         
-        # Check if we've already alerted recently (within 1 hour)
+        # Don't alert for minor issues that auto-resolve
+        # Only alert if:
+        # 1. Sessions stuck and couldn't be reset (in skip_reset)
+        # 2. Routinator issues detected
+        # 3. Multiple sessions have problems
+        # 4. Problem persists for multiple checks
+        
+        serious_issue = False
+        
+        # Check for serious issues
+        if analysis.get('skip_reset'):  # Sessions that can't be reset anymore
+            serious_issue = True
+            logger.info(f"Serious issue: {len(analysis['skip_reset'])} sessions can't be reset")
+        
+        if analysis.get('routinator_issues'):  # Routinator problems
+            serious_issue = True
+            logger.info(f"Serious issue: Routinator problems detected")
+        
+        # If only 1 session in negotiation/syn and can be reset, don't alert yet
+        total_problems = len(analysis.get('idle', [])) + len(analysis.get('negotiation', [])) + len(analysis.get('syn', []))
+        if total_problems == 1 and analysis.get('need_reset'):
+            logger.info(f"Minor issue: Only 1 session with problems, will try reset first")
+            return False
+        
+        # If problems just started (first occurrence), wait one more check
+        prev = self.state.get('previous_analysis', {})
+        if prev.get('healthy', True) and not serious_issue:
+            logger.info("Problems just started, waiting one more check before alerting")
+            self.state['problem_started'] = datetime.now().isoformat()
+            return False
+        
+        # If problem persists but we already alerted recently (within 1 hour)
         if self.state.get('last_alert'):
             try:
                 last_alert = datetime.fromisoformat(self.state['last_alert'])
-                if (datetime.now() - last_alert).total_seconds() < 3600:
-                    logger.info("Alert suppressed (sent within last hour)")
+                time_since_alert = (datetime.now() - last_alert).total_seconds()
+                
+                # For non-serious issues, wait 1 hour
+                if not serious_issue and time_since_alert < 3600:
+                    logger.info(f"Alert suppressed (sent {time_since_alert/60:.0f} minutes ago)")
                     return False
+                
+                # For serious issues, still wait at least 15 minutes
+                if serious_issue and time_since_alert < 900:
+                    logger.info(f"Serious issue but alert sent {time_since_alert/60:.0f} minutes ago, waiting")
+                    return False
+                    
             except:
                 pass
         
@@ -964,17 +1004,22 @@ class RPKIChecker:
                 self.reset_sessions(analysis['need_reset'])
             
             # Check for recovery and send recovery notification
+            # Only send recovery if we actually sent an alert before
             if self.check_for_recovery(analysis) and self.should_send_recovery_alert():
-                # Get recovered sessions
-                prev = self.state.get('previous_analysis', {})
-                prev_issues = set(prev.get('idle', [])) | set(prev.get('negotiation', [])) | set(prev.get('syn', []))
-                curr_established = set(analysis.get('established', []))
-                recovered_sessions = prev_issues & curr_established
-                
-                subject = f"[RPKI Monitor] ✅ Recovery: Sessions Restored"
-                
-                # Create recovery email
-                body = f"""
+                # Only send recovery email if we had sent an alert email before
+                if not self.state.get('last_alert'):
+                    logger.info("Recovery detected but no previous alert was sent, skipping recovery email")
+                else:
+                    # Get recovered sessions
+                    prev = self.state.get('previous_analysis', {})
+                    prev_issues = set(prev.get('idle', [])) | set(prev.get('negotiation', [])) | set(prev.get('syn', []))
+                    curr_established = set(analysis.get('established', []))
+                    recovered_sessions = prev_issues & curr_established
+                    
+                    subject = f"[RPKI Monitor] ✅ Recovery: Sessions Restored"
+                    
+                    # Create recovery email
+                    body = f"""
                 <!DOCTYPE html>
                 <html>
                 <head>
@@ -1140,11 +1185,11 @@ class RPKIChecker:
                     </div>
                 </body>
                 </html>
-                """
-                
-                if self.send_alert_email(subject, body):
-                    self.state['last_recovery_alert'] = datetime.now().isoformat()
-                    logger.info(f"Recovery notification sent for {len(recovered_sessions)} sessions")
+                    """
+                    
+                    if self.send_alert_email(subject, body):
+                        self.state['last_recovery_alert'] = datetime.now().isoformat()
+                        logger.info(f"Recovery notification sent for {len(recovered_sessions)} sessions")
             
             # Send alert if needed
             elif not analysis['healthy'] and self.should_send_alert(analysis):
