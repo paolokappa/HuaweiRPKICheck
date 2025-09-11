@@ -135,8 +135,11 @@ Before committing changes:
 
 ### Monitored Routinator Servers
 - lg.goline.ch (185.54.81.23)
+  - SSH: root / ViaCroceCampagna2
 - time.goline.ch (185.54.81.25)
+  - SSH: root / ViaCroceCampagna2
 - Both monitored continuously every 15 minutes
+- Local server: domoticz.buonvicini.local
 
 ### Key Improvements in v3.2
 1. **Faster recovery**: 3-minute timeout vs 30 minutes
@@ -153,8 +156,8 @@ Before committing changes:
 - GitHub repo: https://github.com/paolokappa/HuaweiRPKICheck
 
 ## Last Update
-- Date: September 8, 2025
-- Version: 3.2
+- Date: September 12, 2025
+- Version: 3.6
 - Status: Production ready, fully tested
-- Email: Working
+- Email: Outlook-compatible template
 - Cron: No errors
