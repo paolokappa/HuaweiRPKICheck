@@ -511,7 +511,7 @@ class RPKIChecker:
             return 0
     
     def analyze_sessions(self, sessions: List[Dict]) -> Dict:
-        """Analyze session status and determine if action is needed"""
+        """Analyze session status with intelligent reset decision logic"""
         analysis = {
             'total': len(sessions),
             'established': [],
@@ -520,6 +520,7 @@ class RPKIChecker:
             'negotiation': [],
             'syn': [],
             'need_reset': [],
+            'skip_reset': [],  # Sessions to skip due to recent resets
             'healthy': True,
             'issues': [],
             'routinator_issues': []  # Track potential Routinator problems
@@ -529,59 +530,96 @@ class RPKIChecker:
         negotiation_timeout = NEGOTIATION_TIMEOUT_MINUTES
         syn_timeout = 2  # Reset SYN sessions stuck for more than 2 minutes
         
+        # Load reset history for intelligent decision making
+        reset_history = self.state.get('reset_history', {})
+        current_time = datetime.now()
+        
         for session in sessions:
             state = session['state'].lower()
+            session_ip = session['ip']
+            
+            # Check reset history for this session
+            last_reset_info = reset_history.get(session_ip, {})
+            if last_reset_info:
+                last_reset_time = datetime.fromisoformat(last_reset_info.get('timestamp', '2020-01-01'))
+                time_since_reset = (current_time - last_reset_time).total_seconds() / 60  # minutes
+                reset_count = last_reset_info.get('count', 0)
+            else:
+                time_since_reset = float('inf')
+                reset_count = 0
+            
+            # Intelligent reset decision based on history
+            should_reset = False
+            skip_reason = None
             
             if state == 'established':
                 # Check if session has both IPv4 and IPv6 prefixes
                 if session['ipv4_count'] > 0 and session['ipv6_count'] > 0:
-                    analysis['established'].append(session['ip'])
+                    analysis['established'].append(session_ip)
+                    # Clear reset history for successful sessions
+                    if session_ip in reset_history and time_since_reset > 30:
+                        del reset_history[session_ip]
                 elif session['ipv4_count'] == 0 and session['ipv6_count'] > 0:
                     # Missing IPv4 prefixes - likely Routinator issue
-                    analysis['partial'].append(session['ip'])
-                    analysis['routinator_issues'].append(f"{session['ip']}: Missing IPv4 prefixes (0/{session['ipv6_count']})")
-                    logger.warning(f"Session {session['ip']} established but missing IPv4 prefixes - Routinator issue?")
+                    analysis['partial'].append(session_ip)
+                    analysis['routinator_issues'].append(f"{session_ip}: Missing IPv4 prefixes (0/{session['ipv6_count']})")
+                    logger.warning(f"Session {session_ip} established but missing IPv4 prefixes - Routinator issue?")
                 elif session['ipv4_count'] > 0 and session['ipv6_count'] == 0:
                     # Missing IPv6 prefixes
-                    analysis['partial'].append(session['ip'])
-                    analysis['routinator_issues'].append(f"{session['ip']}: Missing IPv6 prefixes ({session['ipv4_count']}/0)")
-                    logger.warning(f"Session {session['ip']} established but missing IPv6 prefixes")
+                    analysis['partial'].append(session_ip)
+                    analysis['routinator_issues'].append(f"{session_ip}: Missing IPv6 prefixes ({session['ipv4_count']}/0)")
+                    logger.warning(f"Session {session_ip} established but missing IPv6 prefixes")
                 else:
                     # No prefixes at all despite being established
-                    analysis['idle'].append(session['ip'])
-                    analysis['need_reset'].append(session['ip'])
+                    analysis['idle'].append(session_ip)
+                    should_reset = True
                     
             elif state == 'idle':
-                analysis['idle'].append(session['ip'])
+                analysis['idle'].append(session_ip)
                 if session['ipv4_count'] == 0 and session['ipv6_count'] == 0:
-                    analysis['need_reset'].append(session['ip'])
+                    should_reset = True
                     
             elif state == 'negotiation':
-                analysis['negotiation'].append(session['ip'])
+                analysis['negotiation'].append(session_ip)
                 
                 # Check how long it's been in negotiation
                 age_minutes = self.parse_age_to_minutes(session.get('age', '0'))
                 
-                # Reset if: no records OR stuck in negotiation for too long
-                if (session['ipv4_count'] == 0 and session['ipv6_count'] == 0) or \
-                   (age_minutes > negotiation_timeout):
-                    analysis['need_reset'].append(session['ip'])
-                    logger.warning(f"Session {session['ip']} stuck in Negotiation for {session.get('age')} ({age_minutes} minutes) - will reset")
+                # Reset if stuck in negotiation for too long
+                if age_minutes > negotiation_timeout:
+                    should_reset = True
+                    logger.warning(f"Session {session_ip} stuck in Negotiation for {session.get('age')} ({age_minutes} minutes)")
                     
             elif state == 'syn':
-                analysis['syn'].append(session['ip'])
+                analysis['syn'].append(session_ip)
                 
                 # Check how long it's been in SYN state
                 age_minutes = self.parse_age_to_minutes(session.get('age', '0'))
                 
                 # Reset if stuck in SYN for too long
                 if age_minutes > syn_timeout:
-                    analysis['need_reset'].append(session['ip'])
-                    logger.warning(f"Session {session['ip']} stuck in SYN for {session.get('age')} ({age_minutes} minutes) - will reset")
-                    
-                    # If repeatedly stuck in SYN, likely a Routinator issue
-                    if session['ip'] in self.state.get('reset_sessions', []):
-                        analysis['routinator_issues'].append(f"{session['ip']}: Repeatedly stuck in SYN - check Routinator")
+                    should_reset = True
+                    logger.warning(f"Session {session_ip} stuck in SYN for {session.get('age')} ({age_minutes} minutes)")
+            
+            # Intelligent reset decision based on history
+            if should_reset:
+                # Check if we've reset this session recently
+                if time_since_reset < 5:  # Less than 5 minutes since last reset
+                    skip_reason = f"Recently reset {time_since_reset:.1f} minutes ago"
+                    analysis['skip_reset'].append(session_ip)
+                    logger.info(f"Skipping reset for {session_ip}: {skip_reason}")
+                elif reset_count >= 3 and time_since_reset < 30:  # 3+ resets in 30 minutes
+                    skip_reason = f"Too many resets ({reset_count}) in short time"
+                    analysis['skip_reset'].append(session_ip)
+                    analysis['routinator_issues'].append(f"{session_ip}: Persistent issues after {reset_count} resets - check Routinator")
+                    logger.warning(f"Skipping reset for {session_ip}: {skip_reason} - likely Routinator issue")
+                else:
+                    # Proceed with reset
+                    analysis['need_reset'].append(session_ip)
+                    logger.info(f"Will reset {session_ip} (last reset: {time_since_reset:.0f} min ago, count: {reset_count})")
+        
+        # Update state with reset history
+        self.state['reset_history'] = reset_history
         
         # Determine health status
         if analysis['idle'] or analysis['negotiation'] or analysis['syn'] or analysis['partial']:
@@ -595,6 +633,8 @@ class RPKIChecker:
                 analysis['issues'].append(f"{len(analysis['syn'])} syn sessions")
             if analysis['partial']:
                 analysis['issues'].append(f"{len(analysis['partial'])} partial sessions (missing prefixes)")
+            if analysis['skip_reset']:
+                analysis['issues'].append(f"{len(analysis['skip_reset'])} sessions skipped (recent resets)")
         
         return analysis
     
@@ -734,10 +774,41 @@ class RPKIChecker:
         # Log summary of reset operations
         logger.info(f"Reset operation summary: {reset_results}")
         
-        # Add recovery monitoring info to state
-        if reset_results:
-            self.state['last_reset'] = datetime.now().isoformat()
-            self.state['reset_sessions'] = list(reset_results.keys())
+        # Update reset history for intelligent tracking
+        reset_history = self.state.get('reset_history', {})
+        current_time = datetime.now()
+        
+        for session_ip, result in reset_results.items():
+            if 'success' in result or 'age_changed' in result or result == 'reset_sent':
+                # Update reset history
+                if session_ip not in reset_history:
+                    reset_history[session_ip] = {
+                        'count': 1,
+                        'timestamp': current_time.isoformat(),
+                        'results': [result]
+                    }
+                else:
+                    reset_history[session_ip]['count'] += 1
+                    reset_history[session_ip]['timestamp'] = current_time.isoformat()
+                    # Keep only last 5 results
+                    reset_history[session_ip]['results'] = reset_history[session_ip].get('results', [])[-4:] + [result]
+                
+                logger.info(f"Updated reset history for {session_ip}: count={reset_history[session_ip]['count']}")
+        
+        # Clean old history entries (older than 24 hours)
+        for ip in list(reset_history.keys()):
+            try:
+                last_reset = datetime.fromisoformat(reset_history[ip]['timestamp'])
+                if (current_time - last_reset).days >= 1:
+                    logger.info(f"Removing old reset history for {ip} (older than 24 hours)")
+                    del reset_history[ip]
+            except:
+                pass
+        
+        # Save updated state
+        self.state['reset_history'] = reset_history
+        self.state['last_reset'] = current_time.isoformat()
+        self.state['reset_sessions'] = list(reset_results.keys())
         
         return success
     
